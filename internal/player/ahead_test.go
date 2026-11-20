@@ -42,7 +42,7 @@ func testAutomixHandoff(t *testing.T, demucs bool) {
 			old.events[i].at += offset
 		}
 		old.start, old.end = offset, out.Duration()
-		incoming.events[1].at += 75 * time.Millisecond
+		incoming.events[1].at += 175 * time.Millisecond
 		n := &nextRhythm{source: "s", id: "b", quality: quality, cancel: func() {}}
 		n.pair.Store(&automixPair{out: old, in: incoming, stemsReady: true})
 		p.nextRhythm = n
@@ -66,10 +66,46 @@ func testAutomixHandoff(t *testing.T, demucs bool) {
 	if p.Current().ID != "b" || p.handoff != out || !out.Playing() {
 		t.Fatal("Automix did not keep the outgoing track during the next track's startup")
 	}
-	if info := p.AutomixInfo(); !info.Queued || info.Beats != 0 || info.Cue != 0 {
+	if info := p.AutomixInfo(); !info.Queued || info.Bridge || info.Beats != 0 || info.Cue != 0 {
 		t.Fatalf("expected a standard fade from the incoming track's beginning: %+v", info)
 	}
 	settle(t, posts, p)
+}
+
+// The playback scheduler keeps native speed when it prepares a beat-guided handoff across a large BPM gap.
+func TestAutomixSchedulesOriginalTempoBridge(t *testing.T) {
+	_, p := posted()
+	t.Cleanup(p.stop)
+	p.Cue([]music.Track{{ID: "a", Source: "s"}, {ID: "b", Source: "s"}})
+	p.Source = func(string) music.Source { return &served{} }
+	p.Automix = func() bool { return true }
+	out := p.out
+	out.Pause()
+	out.Seek(out.Duration() - 8*time.Second)
+	out.Play()
+	engine := &demucsEngine{mode: DemucsCPU}
+	engine.rhythm.Store(true)
+	p.stream = &demucsStream{engine: engine, cancel: func() {}}
+	old := automixGrid(2640*time.Millisecond, 2640*time.Millisecond, 2640*time.Millisecond, 2640*time.Millisecond)
+	in := automixGrid(1760*time.Millisecond, 1760*time.Millisecond, 1760*time.Millisecond)
+	offset := out.Duration() - old.end
+	for i := range old.events {
+		old.events[i].at += offset
+	}
+	old.start, old.end = offset, out.Duration()
+	quality := p.playbackQuality()
+	next := &nextRhythm{source: "s", id: "b", quality: quality, cancel: func() {}}
+	next.pair.Store(&automixPair{out: old, in: in, stemsReady: true})
+	p.nextRhythm = next
+	done := make(chan struct{})
+	close(done)
+	p.ahead = &ahead{source: "s", id: "b", quality: quality, done: done}
+	p.after = func(time.Duration, func()) {}
+	p.scheduleAutomix(out)
+	info := p.AutomixInfo()
+	if !info.Queued || !info.Bridge || info.Bars != 0 || out.Speed() != 1 || p.Current().ID != "a" {
+		t.Fatalf("scheduler did not prepare an original-tempo bridge: %+v, speed %.3f", info, out.Speed())
+	}
 }
 
 // Adding a next track during playback starts prefetch and exposes readiness before the handoff.

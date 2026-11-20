@@ -11,8 +11,10 @@ const automixFeatureStep = 50 * time.Millisecond
 
 type automixEnergy struct{ level, low, high float64 }
 type automixStem struct {
-	vocal, drums float64
-	known        bool
+	power  [demucsStemCount]float64
+	chroma [12]float64
+	vocal  float64
+	known  bool
 }
 
 type automixPair struct {
@@ -34,7 +36,7 @@ func analyzeAutomixPair(ctx context.Context, engine *demucsEngine, out, in strea
 	if ctx.Err() != nil {
 		return
 	}
-	if matchBars(a, b, end, 0).count == 0 {
+	if matchBars(a, b, end, 0).count == 0 && !planAutomixBridge(a, b, end, 0).bridge {
 		publish(&automixPair{out: a, in: b, stemsReady: true})
 		return
 	}
@@ -97,7 +99,7 @@ func (t *beatTimeline) accent(at time.Duration) float64 {
 		x := t.energy[i]
 		mix := math.Sqrt(.65*x.low + .35*x.level)
 		if i < len(t.stems) && t.stems[i].known {
-			return .35*mix + .65*t.stems[i].drums
+			return .35*mix + .65*math.Sqrt(t.stems[i].power[demucsDrums])
 		}
 		return mix
 	}
@@ -170,32 +172,64 @@ func analyzeAutomixStemBlock(ctx context.Context, engine *demucsEngine, pcm []fl
 	if result.err != nil || len(result.bed) != (hi-lo)*demucsFrameSamples {
 		return false
 	}
+	backing := make([]float32, 2*(hi-lo))
+	for i := lo; i < hi; i++ {
+		x := result.bed[(i-lo)*demucsFrameSamples:]
+		for ch := range 2 {
+			dry := pcm[2*i+ch]
+			if math.IsNaN(float64(dry)) || math.IsInf(float64(dry), 0) {
+				continue
+			}
+			// The native packet has no raw Other pair. The stereo mixer assigns the residual to Other.
+			other := dry - x[10+ch] - x[12+ch] - x[14+ch]
+			backing[2*(i-lo)+ch] = other + .5*x[14+ch]
+		}
+	}
+	toneStart := time.Duration(lo) * time.Second / time.Duration(rate)
+	tones := analyzeTones(ctx, backing, rate, toneStart)
+	nextTone := 0
 	for bin := range stems {
 		frame := start + bin*hop
-		var voice, drums, total float64
+		var total float64
+		var power [demucsStemCount]float64
 		for i := frame; i < frame+hop; i += 4 {
 			x := result.bed[(i-lo)*demucsFrameSamples:]
 			for ch := range 2 {
-				v, d, dry := float64(x[10+ch]), float64(x[12+ch]), float64(pcm[2*i+ch])
-				voice += v * v
-				drums += d * d
-				if !math.IsNaN(dry) && !math.IsInf(dry, 0) {
-					total += dry * dry
+				dry := float64(pcm[2*i+ch])
+				if math.IsNaN(dry) || math.IsInf(dry, 0) {
+					continue
 				}
+				total += dry * dry
+				for stem := range demucsOther {
+					sample := float64(x[atmosPCMChannels+2*stem+ch])
+					power[stem] += sample * sample
+					dry -= sample
+				}
+				power[demucsOther] += dry * dry
 			}
 		}
 		samples := float64(2 * ((hop + 3) / 4))
-		power := voice / samples
-		strength := min(1, max(0, (10*math.Log10(power+1e-12)+40)/16))
-		stems[bin] = automixStem{vocal: strength * min(1, math.Sqrt(voice/(total+1e-8))/.27), drums: math.Sqrt(drums / samples), known: true}
+		voice := power[demucsVocals] / samples
+		strength := min(1, max(0, (10*math.Log10(voice+1e-12)+40)/16))
+		for i := range power {
+			power[i] /= samples
+		}
+		stems[bin] = automixStem{vocal: strength * min(1, math.Sqrt(voice/(total/samples+1e-8))/.27), power: power, known: true}
+		at := time.Duration(frame+hop/2) * time.Second / time.Duration(rate)
+		for nextTone+1 < len(tones) && (tones[nextTone+1].at-at).Abs() <= (tones[nextTone].at-at).Abs() {
+			nextTone++
+		}
+		if nextTone < len(tones) && (tones[nextTone].at-at).Abs() <= 300*time.Millisecond {
+			stems[bin].chroma = tones[nextTone].chroma
+		}
 	}
 	return true
 }
 
-func (t *beatTimeline) vocalAt(at time.Duration) float64 {
+func (t *beatTimeline) stemAt(at time.Duration) automixStem {
 	i := int((at - t.start) / automixFeatureStep)
 	if at < t.start || i >= len(t.stems) {
-		return 0
+		return automixStem{}
 	}
-	return t.stems[i].vocal
+	return t.stems[i]
 }

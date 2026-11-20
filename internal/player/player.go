@@ -806,7 +806,7 @@ func (p *Player) loadTrack(at, skipped, dir int, play bool, from, overlap time.D
 	p.stop()
 	if outgoing != nil {
 		p.handoff = outgoing
-		if mix != nil && mix.count == 0 {
+		if mix != nil && !mix.timed() {
 			mix = &automixPlan{target: mix.target, overlap: overlap}
 		}
 		p.automixMix = mix
@@ -908,7 +908,7 @@ func (p *Player) loadTrack(at, skipped, dir int, play bool, from, overlap time.D
 			p.applyMetronome()
 			waitForFirstRead := outgoing != nil && p.handoff == outgoing
 			if waitForFirstRead {
-				if mix != nil && mix.count > 0 && s.Channels() == 2 && p.pending == mix.cue {
+				if mix.timed() && s.Channels() == 2 && p.pending == mix.cue {
 					p.watch.setAutomix(mix, true)
 				}
 				if p.pending > 0 {
@@ -919,7 +919,7 @@ func (p *Player) loadTrack(at, skipped, dir int, play bool, from, overlap time.D
 					if gen != p.gen || p.out == nil || !p.playing || p.out.Playing() || p.seeking {
 						return
 					}
-					if mix != nil && mix.count > 0 {
+					if mix.timed() {
 						wait := mix.target - automixMixPosition(outgoing)
 						atCue := (p.out.Position() - mix.cue).Abs() < time.Millisecond
 						ready := buffered && p.handoff == outgoing && outgoing.Playing() && p.Automix() && s.Channels() == 2 &&
@@ -933,7 +933,6 @@ func (p *Player) loadTrack(at, skipped, dir int, play bool, from, overlap time.D
 							if outgoingWatch != nil {
 								outgoingWatch.setAutomix(nil, false)
 							}
-							outgoing.SetSpeed(1).SetPreservesPitch(false)
 							if atCue {
 								p.out.Seek(0)
 							}
@@ -945,7 +944,7 @@ func (p *Player) loadTrack(at, skipped, dir int, play bool, from, overlap time.D
 					}
 					if p.handoff == outgoing && outgoing.Playing() {
 						duration := overlap
-						if mix == nil || mix.count == 0 {
+						if !mix.timed() {
 							remaining := outgoing.Duration() - automixMixPosition(outgoing)
 							duration = min(overlap, max(trackHandoffFade, remaining))
 							if mix != nil {

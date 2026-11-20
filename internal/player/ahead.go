@@ -2,6 +2,7 @@ package player
 
 import (
 	"context"
+	"math"
 	"sync/atomic"
 	"time"
 
@@ -95,6 +96,7 @@ func (p *Player) scheduleAutomix(out *audio.Player) {
 	if post == nil {
 		post = p.post
 	}
+	missedCue := false
 	var check func()
 	check = func() {
 		if p.out != out {
@@ -107,6 +109,10 @@ func (p *Player) scheduleAutomix(out *audio.Player) {
 			return
 		}
 		wait := min(time.Second, max(150*time.Millisecond, remaining-5*time.Second))
+		if speed := out.Speed(); missedCue && speed != 1 {
+			out.SetSpeed(stepAutomixSpeed(speed, 1, automixTempoTick))
+			wait = min(wait, automixTempoTick)
+		}
 		quality := p.playbackQuality()
 		if p.ahead != nil && p.ahead.quality != quality {
 			p.refreshAhead()
@@ -127,11 +133,15 @@ func (p *Player) scheduleAutomix(out *audio.Player) {
 				if prep := p.automixPrep; prep != nil && prep.next != p.nextRhythm {
 					p.cancelAutomixPrep()
 				}
-				if p.automixPrep == nil && p.nextRhythm != nil {
+				if p.automixPrep == nil && p.nextRhythm != nil && !missedCue {
 					if pair := p.nextRhythm.pair.Load(); pair != nil {
 						plan := matchBars(pair.out, pair.in, out.Duration(), position)
+						if plan.count == 0 {
+							plan = planAutomixBridge(pair.out, pair.in, out.Duration(), position)
+						}
 						// Give stem analysis time to finish without missing a usable downbeat.
-						if plan.count > 0 && (pair.stemsReady || plan.target-position <= 5*time.Second) {
+						rampDue := plan.count > 0 && plan.bars[0].speed != 1 && plan.rampStart-position <= time.Second
+						if plan.timed() && (pair.stemsReady || rampDue || plan.target-position <= 5*time.Second) {
 							if !pair.stemsReady {
 								p.nextRhythm.cancel()
 							}
@@ -149,19 +159,24 @@ func (p *Player) scheduleAutomix(out *audio.Player) {
 				position = automixMixPosition(out)
 				plan := &prep.plan
 				delta := plan.target - position
+				speed, next := plan.approach(position)
 				switch {
 				case delta > automixLead:
-					speed, next := plan.approach(position)
 					if out.Speed() != speed {
 						out.SetPreservesPitch(true).SetSpeed(speed)
 					}
 					wait = min(wait, time.Duration(float64(min(next-position, delta-automixLead))/speed))
-				case delta > 80*time.Millisecond:
+				case delta > 80*time.Millisecond && math.Abs(out.Speed()-speed) <= .02:
 					p.automixPrep = nil // handoff takes ownership of the running transition
 					p.loadTrack((p.at+1)%len(p.order), 0, forward, true, plan.cue, plan.overlap, plan)
 					return
 				default:
-					p.cancelAutomixPrep()
+					// Keep playing the current track if we missed the cue. Give its tempo time to settle.
+					missedCue, p.automixPrep = true, nil
+					if prep.watch != nil {
+						prep.watch.setAutomix(nil, false)
+					}
+					wait = min(wait, automixTempoTick)
 				}
 			}
 			if p.automixPrep == nil && remaining <= automixOverlap {

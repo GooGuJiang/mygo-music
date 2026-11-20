@@ -36,8 +36,9 @@ func (w *watched) setAutomix(plan *automixPlan, incoming bool) {
 	if plan != nil {
 		rate := w.SampleRate()
 		eq = newAutomixEQ(plan, rate, incoming)
-		if w.rhythm != nil && plan.stems.vocal > 0 {
+		if w.rhythm != nil {
 			stems = newAutomixStemEnvelope(plan, rate, incoming)
+			eq.stemMix = plan.stems.analyzed || plan.bridge
 		}
 	}
 	if w.rhythm != nil {

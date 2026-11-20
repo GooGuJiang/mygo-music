@@ -61,16 +61,23 @@ func TestNativeAutomixPair(t *testing.T) {
 	if pair == nil || !pair.stemsReady || len(pair.out.stems) == 0 || len(pair.in.stems) == 0 {
 		t.Fatal("native analysis did not publish both separated excerpts")
 	}
-	if !slices.ContainsFunc(pair.out.stems, func(frame automixStem) bool { return frame.vocal > .5 }) ||
-		!slices.ContainsFunc(pair.in.stems, func(frame automixStem) bool { return frame.drums > .01 }) {
-		t.Fatal("the music fixture did not produce distinct vocals and drums")
+	if !slices.ContainsFunc(pair.out.stems, func(frame automixStem) bool { return frame.vocal > .5 }) {
+		t.Fatal("the music fixture did not produce a distinct vocal")
+	}
+	for _, stem := range []int{demucsDrums, demucsBass, demucsOther} {
+		if !slices.ContainsFunc(pair.in.stems, func(frame automixStem) bool { return frame.power[stem] > .0001 }) {
+			t.Fatalf("the music fixture did not produce energy in stem %d", stem)
+		}
 	}
 	if partial == nil || partial.stemsReady || partial.out.stems[0].known || !partial.out.stems[len(partial.out.stems)-1].known ||
 		!partial.in.stems[0].known || partial.in.stems[len(partial.in.stems)-1].known {
 		t.Fatal("partial analysis did not publish the outgoing tail and incoming head first")
 	}
-	if plan := matchBars(pair.out, pair.in, automixWindow, 0); plan.count == 0 || plan.beats == 0 {
-		t.Fatal("the native beat grids did not yield a playable overlap")
+	if !slices.ContainsFunc(pair.in.stems, func(frame automixStem) bool { return frame.chroma != [12]float64{} }) {
+		t.Fatal("the native accompaniment did not yield local harmony")
+	}
+	if plan := matchBars(pair.out, pair.in, automixWindow, 0); plan.count == 0 || plan.beats == 0 || !plan.stems.analyzed {
+		t.Fatal("the native beat grids did not yield an analyzed four-stem overlap")
 	}
 }
 

@@ -25,6 +25,7 @@ type fader struct {
 	handoff     *audio.Player
 	handoffGain float64
 	mix         *automixPlan
+	tempoAt     time.Time
 	gain        float64 // the listener's volume and the track's gain, together
 	from        float64 // the level faded from at start, to to over dur
 	to          float64
@@ -49,22 +50,35 @@ func (f *fader) apply(now time.Time) {
 	level := f.level(now)
 	gain := f.gain * level
 	if f.handoff != nil {
+		if f.mix != nil && f.mix.bridge {
+			level = f.mix.bridgeProgress(level)
+		}
 		out, in := handoffGains(level, f.handoffGain, f.gain)
 		f.handoff.SetVolume(out)
 		gain = in
-		if m := f.mix; m != nil {
-			_, speed := m.alignment(max(0, now.Sub(f.start)))
+		speed := 1.0
+		if m := f.mix; m != nil && m.count > 0 {
+			_, speed = m.alignment(max(0, now.Sub(f.start)))
 			if heard := f.out.Position() - m.cue; heard > 50*time.Millisecond && heard < m.overlap {
 				want, _ := m.alignment(heard)
 				drift := (want - f.handoff.Position()).Seconds()
-				speed += max(-.04, min(.04, drift/.6))
+				speed += max(-.025, min(.025, drift/.6))
 			}
-			f.handoff.SetSpeed(speed)
 		}
+		current := f.handoff.Speed()
+		if current != speed {
+			f.handoff.SetSpeed(stepAutomixSpeed(current, speed, now.Sub(f.tempoAt)))
+		}
+		f.tempoAt = now
 	}
 	if f.out != nil {
 		f.out.SetVolume(gain)
 	}
+}
+
+func stepAutomixSpeed(current, target float64, elapsed time.Duration) float64 {
+	step := .15 * min(automixTempoTick, max(0, elapsed)).Seconds()
+	return min(current+step, max(current-step, min(automixMaxSpeed, max(automixMinSpeed, target))))
 }
 
 func handoffGains(progress, outgoing, incoming float64) (float64, float64) {
@@ -93,9 +107,12 @@ func (f *fader) setHandoff(out *audio.Player, mix *automixPlan) {
 	f.handoff, f.mix = out, nil
 	if out != nil {
 		f.handoffGain = out.Volume()
-		if mix != nil && mix.count > 0 {
+		f.tempoAt = time.Now()
+		if mix.timed() {
 			f.mix = mix
-			out.SetPreservesPitch(true).SetSpeed(mix.bars[0].speed)
+			if mix.count > 0 {
+				out.SetPreservesPitch(true)
+			}
 		}
 	}
 }

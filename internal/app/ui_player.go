@@ -601,12 +601,16 @@ func (a *app) automixDetails(c *ui.Context) {
 	switch {
 	case info.Active && info.Bars > 0:
 		status = T("Beat-matched crossfade")
+	case info.Active && info.Bridge:
+		status = T("Original-tempo transition")
 	case info.Active:
 		status = T("Standard crossfade")
 	case !a.settings.Automix:
 		status = T("Automix is off")
 	case info.Queued && info.Bars > 0:
 		status = T("Preparing beat match")
+	case info.Queued && info.Bridge:
+		status = T("Preparing original-tempo transition")
 	case info.Queued:
 		status = T("Preparing standard crossfade")
 	case a.settings.dolbyProfile().Spatial:

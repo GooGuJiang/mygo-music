@@ -35,23 +35,14 @@ func TestAutomixProgressMarkerUsesTrackTime(t *testing.T) {
 
 // Each outgoing bar lands at the next incoming downbeat even when the bar durations differ.
 func TestAutomixAlignsUnevenBars(t *testing.T) {
-	out := automixGrid(2*time.Second, 2*time.Second, 2*time.Second, 2*time.Second, 2100*time.Millisecond, 1920*time.Millisecond)
+	out := automixGrid(2*time.Second, 2*time.Second, 2*time.Second, 2*time.Second, 2040*time.Millisecond, 1980*time.Millisecond)
 	in := automixGrid(2*time.Second, 2040*time.Millisecond)
 	plan := matchBars(out, in, out.end, 0)
 	if plan.count != 2 || plan.target != 8*time.Second || plan.cue != 0 || plan.overlap != 4040*time.Millisecond {
 		t.Fatalf("unexpected transition: %+v", plan)
 	}
-	if at, speed := plan.alignment(2 * time.Second); at != 10100*time.Millisecond || math.Abs(speed-1920.0/2040) > 1e-12 {
+	if at, speed := plan.alignment(2 * time.Second); at != 10040*time.Millisecond || math.Abs(speed-1980.0/2040) > 1e-12 {
 		t.Fatalf("second downbeat landed at %s with speed %.4f", at, speed)
-	}
-	if speed, next := plan.approach(1900 * time.Millisecond); speed != 1 || next != 2*time.Second {
-		t.Fatalf("tempo changed before the ramp downbeat: %.4f, next %s", speed, next)
-	}
-	if speed, next := plan.approach(2 * time.Second); speed != 1 || next != 4*time.Second {
-		t.Fatalf("first ramp bar did not start at the original tempo: %.4f, next %s", speed, next)
-	}
-	if speed, _ := plan.approach(4 * time.Second); speed <= 1 || speed >= plan.bars[0].speed {
-		t.Fatalf("tempo did not ramp before the overlap: %.4f", speed)
 	}
 	if plan := matchBars(out, automixGrid(5800*time.Millisecond, 5800*time.Millisecond), out.end, 0); plan.count != 0 {
 		t.Fatalf("accepted an excessive tempo change: %+v", plan)
@@ -71,16 +62,85 @@ func automixGrid(lengths ...time.Duration) *beatTimeline {
 	return w
 }
 
-// A 90-to-135 BPM pair can use all eight bars and keep the incoming track at its original tempo.
-func TestAutomixUsesEightBarsAtWideTempoDifference(t *testing.T) {
-	var slow, fast [9]time.Duration
-	for i := range slow {
-		slow[i], fast[i] = 2640*time.Millisecond, 1760*time.Millisecond
+// A 90-to-135 BPM jump trades pulses at the original speeds instead of stretching the outgoing song by fifty percent.
+func TestAutomixBridgesLargeTempoDifference(t *testing.T) {
+	out := automixGrid(2640*time.Millisecond, 2640*time.Millisecond, 2640*time.Millisecond, 2640*time.Millisecond)
+	in := automixGrid(1760*time.Millisecond, 1760*time.Millisecond, 1760*time.Millisecond)
+	if plan := matchBars(out, in, out.end, 0); plan.count != 0 {
+		t.Fatalf("a 50 percent speed change was selected: %+v", plan)
 	}
-	out, in := automixGrid(slow[:]...), automixGrid(fast[:]...)
+	plan := planAutomixBridge(out, in, out.end, 0)
+	if !plan.timed() || !plan.bridge || plan.overlap > 1250*time.Millisecond || plan.cue > 1200*time.Millisecond {
+		t.Fatalf("no short bridge at native tempo: %+v", plan)
+	}
+	containsBeat := func(grid *beatTimeline, target time.Duration) bool {
+		for _, event := range grid.events {
+			if event.at == target {
+				return true
+			}
+		}
+		return false
+	}
+	if at, speed := plan.alignment(plan.pivot); speed != 1 || !containsBeat(out, at) || !containsBeat(in, plan.cue+plan.pivot) {
+		t.Fatalf("bridge failed to cross at a real pulse on both tracks: %+v", plan)
+	}
+}
+
+// A moderate match reaches its target speed before preload starts, and is rejected if playback has passed the ramp start.
+func TestAutomixApproachesTempoWithoutAStep(t *testing.T) {
+	out := automixGrid(2280*time.Millisecond, 2280*time.Millisecond, 2280*time.Millisecond, 2280*time.Millisecond)
+	in := automixGrid(2*time.Second, 2*time.Second, 2*time.Second, 2*time.Second)
 	plan := matchBars(out, in, out.end, 0)
-	if plan.count != 8 || plan.cue != 0 || plan.target != slow[0] || plan.overlap != 8*fast[0] || plan.bars[0].speed != 1.5 {
-		t.Fatalf("expected all eight matched bars: %+v", plan)
+	if plan.count == 0 {
+		t.Fatal("a moderate tempo change with room for the ramp was rejected")
+	}
+	start, end := plan.rampStart, plan.target-automixRampLead
+	previous, _ := plan.approach(start)
+	if previous != 1 {
+		t.Fatalf("ramp started at %.4f", previous)
+	}
+	for at := start + automixTempoTick; at < end; at += automixTempoTick {
+		speed, _ := plan.approach(at)
+		if speed < previous || math.Log(speed/previous) > automixMaxTempoSlope*automixTempoTick.Seconds() {
+			t.Fatalf("ramp stepped from %.4f to %.4f at %s", previous, speed, at)
+		}
+		previous = speed
+	}
+	if speed, _ := plan.approach(end); speed != plan.bars[0].speed || speed-previous > .003 {
+		t.Fatalf("preload boundary stepped from %.4f to %.4f", previous, speed)
+	}
+	if late := matchBars(out, in, out.end, 5*time.Second); late.count != 0 {
+		t.Fatalf("late playback should leave too little time for the ramp: %+v", late)
+	}
+}
+
+// Bar changes and late fallbacks cannot step the playing deck straight to the next requested speed.
+func TestAutomixHandoffLimitsSpeedChanges(t *testing.T) {
+	out, in := audio.NewPlayer(silence{}), audio.NewPlayer(silence{})
+	t.Cleanup(out.Close)
+	t.Cleanup(in.Close)
+	start := time.Unix(0, 0)
+	plan := &automixPlan{count: 2, overlap: 4 * time.Second, bars: [automixBars]automixBar{
+		{in: 2 * time.Second, out: 2080 * time.Millisecond, speed: 1.04},
+		{in: 2 * time.Second, out: 2200 * time.Millisecond, speed: 1.1},
+	}}
+	out.SetSpeed(1.04)
+	f := fader{out: in, gain: 1, to: 1, start: start, dur: plan.overlap}
+	f.setHandoff(out, plan)
+	if out.Speed() != 1.04 {
+		t.Fatalf("starting handoff changed speed immediately to %.6f", out.Speed())
+	}
+	at := start.Add(2 * time.Second)
+	f.tempoAt = at.Add(-8 * time.Millisecond)
+	f.apply(at)
+	barChange := out.Speed()
+	if barChange <= 1.04 || barChange > 1.04121 {
+		t.Fatalf("bar boundary changed speed too quickly: %.6f", barChange)
+	}
+	f.mix = nil
+	f.apply(at.Add(8 * time.Millisecond))
+	if speed := out.Speed(); speed >= barChange || speed < barChange-.00121 {
+		t.Fatalf("fallback reset speed from %.6f to %.6f", barChange, speed)
 	}
 }
 
@@ -141,12 +201,14 @@ func TestAutomixAvoidsOverlappingVocals(t *testing.T) {
 	out.stems = make([]automixStem, int(out.end/automixFeatureStep))
 	in.stems = make([]automixStem, len(out.stems))
 	for i := range out.stems {
+		out.stems[i].known, in.stems[i].known = true, true
 		out.stems[i].vocal = 1
 		if time.Duration(i)*automixFeatureStep >= 4*time.Second {
 			in.stems[i].vocal = 1
 		}
 	}
-	if plan := matchBars(out, in, out.end, 0); plan.inBars != 2 || plan.cue != 0 || automixVocalClash(out, in, &plan) != 0 {
+	plan := matchBars(out, in, out.end, 0)
+	if clash, _ := automixStemClash(out, in, &plan, 0); plan.inBars != 2 || plan.cue != 0 || clash != 0 {
 		t.Fatalf("expected a blend confined to the intro: %+v", plan)
 	}
 }
@@ -208,6 +270,18 @@ func TestAutomixMatchesKeysFromOverlapAudio(t *testing.T) {
 	if plan := matchBars(out, in, out.end, 0); plan.count != 2 || plan.cue != 0 {
 		t.Fatalf("expected a short beat-matched blend for clashing keys: %+v", plan)
 	}
+	// Quiet melodic stems give the drums room to mix even when the key estimate disagrees.
+	for _, timeline := range []*beatTimeline{out, in} {
+		timeline.stems = make([]automixStem, int(timeline.end/automixFeatureStep))
+		for i := range timeline.stems {
+			timeline.stems[i].known = true
+			timeline.stems[i].power[demucsDrums] = .03
+		}
+	}
+	if plan := matchBars(out, in, out.end, 0); plan.count <= 2 {
+		t.Fatalf("track key blocked a percussive overlap: %+v", plan)
+	}
+	out.stems, in.stems = nil, nil
 	in.tones = append(tones([3]int{54, 58, 61}, 0, 6*time.Second), tones([3]int{48, 52, 55}, 6*time.Second, 6*time.Second)...)
 	if plan := matchBars(out, in, out.end, 0); plan.count < 2 || plan.cue == 0 || in.keyBetween(plan.cue, plan.cue+plan.overlap) != 1 {
 		t.Fatalf("did not prefer a matching section: %+v", plan)
@@ -250,5 +324,12 @@ func TestAutomixEQPassesBassAcross(t *testing.T) {
 	}
 	if dry := makeBass(); in[2*end] != dry[2*end] || in[2*end+1] != dry[2*end+1] {
 		t.Fatal("the incoming track stayed filtered past the overlap")
+	}
+	stems := makeBass()
+	withStems := newAutomixEQ(plan, rate, true)
+	withStems.stemMix = true
+	b.apply(stems, 0, rate, withStems)
+	if energy(stems[:rate/5]) < 4*energy(in[:rate/5]) {
+		t.Fatal("full-band EQ took out the bass that the stem handoff manages separately")
 	}
 }

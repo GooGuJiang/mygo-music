@@ -30,6 +30,22 @@ type watched struct {
 	frame      int64
 }
 
+func (w *watched) setAutomix(plan *automixPlan, incoming bool) {
+	var eq *automixEQ
+	var stems *automixStemEnvelope
+	if plan != nil {
+		rate := w.SampleRate()
+		eq = newAutomixEQ(plan, rate, incoming)
+		if w.rhythm != nil && plan.stems.vocal > 0 {
+			stems = newAutomixStemEnvelope(plan, rate, incoming)
+		}
+	}
+	if w.rhythm != nil {
+		w.rhythm.automix.Store(stems)
+	}
+	w.automix.Store(eq)
+}
+
 func (w *watched) Read(dst []float32) (int, error) {
 	defer w.begin()()
 	n, err := w.stream.Read(dst)

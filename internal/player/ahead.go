@@ -137,7 +137,7 @@ func (p *Player) scheduleAutomix(out *audio.Player) {
 							}
 							p.automixPrep = &automixPreparation{plan: plan, next: p.nextRhythm, out: out, watch: p.watch}
 							if p.watch != nil {
-								p.watch.automix.Store(newAutomixEQ(&plan, p.watch.SampleRate(), false))
+								p.watch.setAutomix(&plan, false)
 							}
 						}
 					}

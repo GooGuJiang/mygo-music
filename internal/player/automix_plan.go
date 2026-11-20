@@ -87,6 +87,9 @@ func matchBars(out, in *beatTimeline, end, position time.Duration) automixPlan {
 			best.ramp = append(best.ramp, at)
 		}
 	}
+	if best.count > 0 {
+		best.stems = planAutomixStems(in, &best)
+	}
 	return best
 }
 

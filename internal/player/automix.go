@@ -22,6 +22,7 @@ type automixPlan struct {
 	ramp                 []time.Duration
 	bars                 [automixBars]automixBar
 	count, inBars, beats int
+	stems                automixStemTiming
 }
 
 type automixPreparation struct {
@@ -110,7 +111,7 @@ func (p *Player) cancelAutomixPrep() {
 		p.automixPrep = nil
 		prep.out.SetSpeed(1).SetPreservesPitch(false)
 		if prep.watch != nil {
-			prep.watch.automix.Store(nil)
+			prep.watch.setAutomix(nil, false)
 		}
 	}
 }

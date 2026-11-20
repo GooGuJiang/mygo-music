@@ -115,6 +115,7 @@ type demucsStream struct {
 	wantedMix   atomic.Pointer[demucsGains]
 	positioning atomic.Bool
 	rhythm      atomic.Pointer[beatTimeline]
+	automix     atomic.Pointer[automixStemEnvelope]
 
 	// Only the playback decoder touches these fields.
 	current, next                             demucsBlock
@@ -181,6 +182,7 @@ func (s *demucsStream) readSurround(stereo, bed, weights []float32) (int, error)
 		}
 	}
 	var used *demucsStats
+	envelope := s.automix.Load()
 	for first := 0; first < frames; {
 		at := position + int64(first)
 		for s.current.request != request || s.current.end() <= at {
@@ -250,9 +252,10 @@ func (s *demucsStream) readSurround(stereo, bed, weights []float32) (int, error)
 					s.gains = s.target
 				}
 			}
-			mixDemucsFrame(dst, src, weight, s.gains)
-			if s.gains != (demucsGains{}) {
-				mixDemucsStereo(stereo[i*2:i*2+2], src, weight, s.gains)
+			gains := envelope.gains(frame, s.gains)
+			mixDemucsFrame(dst, src, weight, gains)
+			if gains != (demucsGains{}) {
+				mixDemucsStereo(stereo[i*2:i*2+2], src, weight, gains)
 			}
 			if applyPlacement {
 				if s.placementFrames > 0 {
@@ -265,7 +268,7 @@ func (s *demucsStream) readSurround(stereo, bed, weights []float32) (int, error)
 						}
 					}
 				}
-				addDemucsPlacement(dst, src, weight, s.gains, &s.placement)
+				addDemucsPlacement(dst, src, weight, gains, &s.placement)
 			}
 		}
 		first = last

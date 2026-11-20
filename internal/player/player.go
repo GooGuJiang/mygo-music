@@ -724,7 +724,7 @@ func (p *Player) finishHandoff(out *audio.Player) {
 		p.automixMix = nil
 		p.fade.setHandoff(nil, nil)
 		if p.watch != nil {
-			p.watch.automix.Store(nil)
+			p.watch.setAutomix(nil, true)
 		}
 		retireOutput(out)
 	}
@@ -909,7 +909,7 @@ func (p *Player) loadTrack(at, skipped, dir int, play bool, from, overlap time.D
 			waitForFirstRead := outgoing != nil && p.handoff == outgoing
 			if waitForFirstRead {
 				if mix != nil && mix.count > 0 && s.Channels() == 2 && p.pending == mix.cue {
-					p.watch.automix.Store(newAutomixEQ(mix, s.SampleRate(), true))
+					p.watch.setAutomix(mix, true)
 				}
 				if p.pending > 0 {
 					p.watch.firstFrame = int64(math.Round(p.pending.Seconds() * float64(s.SampleRate())))
@@ -929,9 +929,9 @@ func (p *Player) loadTrack(at, skipped, dir int, play bool, from, overlap time.D
 							return
 						}
 						if !ready || wait < -110*time.Millisecond {
-							p.watch.automix.Store(nil)
+							p.watch.setAutomix(nil, true)
 							if outgoingWatch != nil {
-								outgoingWatch.automix.Store(nil)
+								outgoingWatch.setAutomix(nil, false)
 							}
 							outgoing.SetSpeed(1).SetPreservesPitch(false)
 							if atCue {

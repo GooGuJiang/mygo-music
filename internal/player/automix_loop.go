@@ -16,13 +16,37 @@ type automixLoopCut struct {
 	start, end time.Duration // one downbeat-to-downbeat excerpt, repeated once
 	voice      time.Duration // vocal fade before the repeat
 	cue        time.Duration // incoming downbeat
+	beat       time.Duration
+	bars       int
 }
 
 func (c automixLoopCut) target() time.Duration { return c.end + (c.end - c.start) }
 
+func automixLoopCandidates(out *beatTimeline, end time.Duration) []automixLoopCut {
+	from := automixDownbeats(out)
+	var candidates []automixLoopCut
+	for i := 0; i+1 < len(from); i++ {
+		for bars := 1; bars <= 2 && i+bars < len(from); bars++ {
+			old := out.events[from[i] : from[i+bars]+1]
+			start, seam := old[0].at, old[len(old)-1].at
+			span := seam - start
+			tail := end - (seam + span + automixLoopTail)
+			if span > automixLoopMax || tail < 180*time.Millisecond || tail > automixOverlap || !reliableAutomixGrid(old) {
+				continue
+			}
+			beat := span / time.Duration(len(old)-1)
+			if (old[1].at - start - (seam - old[len(old)-2].at)).Abs() > beat/5 {
+				continue
+			}
+			candidates = append(candidates, automixLoopCut{start: start, end: seam, voice: min(beat, 650*time.Millisecond), beat: beat, bars: bars})
+		}
+	}
+	return candidates
+}
+
 // Only use a loop when even half- or double-time matching would require a large tempo change.
 func planAutomixLoop(out, in *beatTimeline, end time.Duration) automixLoopCut {
-	from, to := automixDownbeats(out), automixDownbeats(in)
+	loops, to := automixLoopCandidates(out, end), automixDownbeats(in)
 	inPhrases := in.phraseScores(to)
 	var best automixLoopCut
 	bestScore := math.Inf(-1)
@@ -40,46 +64,38 @@ func planAutomixLoop(out, in *beatTimeline, end time.Duration) automixLoopCut {
 		if !ok || cue > 0 && in.stemAt(cue-100*time.Millisecond).vocal > .55 && in.stemAt(cue).vocal > .55 {
 			continue
 		}
-		for i := 0; i+1 < len(from); i++ {
-			for bars := 1; bars <= 2 && i+bars < len(from); bars++ {
-				old := out.events[from[i] : from[i+bars]+1]
-				start, seam := old[0].at, old[len(old)-1].at
-				span := seam - start
-				tail := end - (seam + span + automixLoopTail)
-				if span > automixLoopMax || tail < 180*time.Millisecond || tail > automixOverlap || !reliableAutomixGrid(old) {
-					continue
-				}
-				outBeat := span / time.Duration(len(old)-1)
-				firstBeat, lastBeat := old[1].at-start, seam-old[len(old)-2].at
-				if (firstBeat-lastBeat).Abs() > outBeat/5 || automixLoopCanStretch(outBeat, inBeat) {
-					continue
-				}
-				body, bodyOK := automixLoopFeatures(out, start-automixLoopSeam, seam)
-				carry, carryOK := automixLoopFeatures(out, seam, seam+automixLoopTail)
-				if !bodyOK || !carryOK || body.vocal > .38 || body.power[demucsDrums] < .00015 {
-					continue
-				}
-				key := harmonicMatch(estimateKey(body.chroma), estimateKey(entry.chroma))
-				clash := backingClash(body, entry, key)
-				if body.chroma == [12]float64{} || entry.chroma == [12]float64{} || key < 0 || clash > .58 || key == 0 && clash > .32 {
-					continue
-				}
-				carryClash := backingClash(carry, entry, key)
-				if carry.power[demucsOther] > .0007 && carryClash > .55 {
-					continue
-				}
-				// Prefer a wrap with similar harmony and drum energy on the two sides of the seam.
-				before, _ := automixLoopFeatures(out, seam-outBeat, seam)
-				after, _ := automixLoopFeatures(out, start, start+outBeat)
-				drumJump := math.Abs(math.Log((before.power[demucsDrums] + .00015) / (after.power[demucsDrums] + .00015)))
-				if drumJump > 1.6 {
-					continue
-				}
-				score := .25*float64(key) - clash - .5*carryClash - body.vocal - .2*drumJump -
-					.25*backingClash(before, after, key) + .75*inPhrases[j] - .10*(tail+cue).Seconds() - .08*float64(bars-1)
-				if score > bestScore {
-					best, bestScore = automixLoopCut{start, seam, min(outBeat, 650*time.Millisecond), cue}, score
-				}
+		for _, loop := range loops {
+			start, seam, outBeat := loop.start, loop.end, loop.beat
+			if automixLoopCanStretch(outBeat, inBeat) {
+				continue
+			}
+			body, bodyOK := automixLoopFeatures(out, start-automixLoopSeam, seam)
+			carry, carryOK := automixLoopFeatures(out, seam, seam+automixLoopTail)
+			if !bodyOK || !carryOK || body.vocal > .38 || body.power[demucsDrums] < .00015 {
+				continue
+			}
+			key := harmonicMatch(estimateKey(body.chroma), estimateKey(entry.chroma))
+			clash := backingClash(body, entry, key)
+			if body.chroma == [12]float64{} || entry.chroma == [12]float64{} || key < 0 || clash > .58 || key == 0 && clash > .32 {
+				continue
+			}
+			carryClash := backingClash(carry, entry, key)
+			if carry.power[demucsOther] > .0007 && carryClash > .55 {
+				continue
+			}
+			// Prefer a wrap with similar harmony and drum energy on the two sides of the seam.
+			before, _ := automixLoopFeatures(out, seam-outBeat, seam)
+			after, _ := automixLoopFeatures(out, start, start+outBeat)
+			drumJump := math.Abs(math.Log((before.power[demucsDrums] + .00015) / (after.power[demucsDrums] + .00015)))
+			if drumJump > 1.6 {
+				continue
+			}
+			tail := end - (loop.target() + automixLoopTail)
+			score := .25*float64(key) - clash - .5*carryClash - body.vocal - .2*drumJump -
+				.25*backingClash(before, after, key) + .75*inPhrases[j] - .10*(tail+cue).Seconds() - .08*float64(loop.bars-1)
+			if score > bestScore {
+				loop.cue = cue
+				best, bestScore = loop, score
 			}
 		}
 	}
@@ -130,37 +146,46 @@ type automixLoopAudio struct {
 	cut    automixLoopCut
 	first  int64
 	rate   int
+	resume bool
 	frames [][2 * demucsStemCount]float32
 }
 
-func renderAutomixLoop(c automixLoopCut, t *beatTimeline, rate, first int, dry []float32, split [][2 * demucsOther]float32) *automixLoopAudio {
-	frameAt := func(at time.Duration) int { return int(math.Round((at - t.start).Seconds() * float64(rate))) }
-	start, seam := frameAt(c.start), frameAt(c.end)
-	// Use one exact length in frames so the second pass hits the first beat without rounding drift.
-	length := seam - start
-	pivot := seam + length
-	begin, finish := frameAt(c.end-c.voice), pivot+rate*int(automixLoopTail/time.Millisecond)/1000
-	edge := max(1, rate*int(automixLoopSeam/time.Millisecond)/1000)
-	if length <= edge || min(start-edge, begin) < first || seam+finish-pivot > first+len(split) || seam+finish-pivot > len(dry)/2 {
+type automixStemSource struct {
+	timeline    *beatTimeline
+	rate, first int
+	dry         []float32
+	split       [][2 * demucsOther]float32
+}
+
+func (s automixStemSource) render(from, end time.Duration, c automixLoopCut, resume bool, gainsAt func(time.Duration) [demucsStemCount]float32) *automixLoopAudio {
+	frameAt := func(at time.Duration) int {
+		return int(math.Round((at - s.timeline.start).Seconds() * float64(s.rate)))
+	}
+	begin, finish := frameAt(from), frameAt(end)
+	start, seam, length, first, limit := 0, finish, 0, begin, finish
+	edge := max(1, s.rate*int(automixLoopSeam/time.Millisecond)/1000)
+	if c.end > c.start {
+		start, seam = frameAt(c.start), frameAt(c.end)
+		length = seam - start
+		first, limit = min(begin, start-edge), max(seam, finish-length)
+		if length <= edge || finish <= seam {
+			return nil
+		}
+	}
+	if first < s.first || limit > min(s.first+len(s.split), len(s.dry)/2) || finish <= begin {
 		return nil
 	}
-	audio := &automixLoopAudio{cut: c, first: int64(t.start)*int64(rate)/int64(time.Second) + int64(begin), rate: rate,
-		frames: make([][2 * demucsStemCount]float32, finish-begin)}
+	a := &automixLoopAudio{cut: c, first: int64(s.timeline.start)*int64(s.rate)/int64(time.Second) + int64(begin), rate: s.rate,
+		resume: resume, frames: make([][2 * demucsStemCount]float32, finish-begin)}
 	read := func(at, stem, ch int) float32 {
-		s := split[at-first]
+		x := s.split[at-s.first]
 		if stem < demucsOther {
-			return s[2*stem+ch]
+			return x[2*stem+ch]
 		}
-		return dry[2*at+ch] - s[ch] - s[2+ch] - s[4+ch]
+		return s.dry[2*at+ch] - x[ch] - x[2+ch] - x[4+ch]
 	}
 	for i := begin; i < finish; i++ {
-		fade := func(a, b int) float32 { return float32(automixRampProgress(int64(i), int64(a), int64(b))) }
-		gains := [demucsStemCount]float32{
-			1 - fade(begin, seam-edge),
-			1 - fade(pivot-rate*75/1000, pivot),
-			1 - fade(pivot-rate*240/1000, pivot),
-			(1 - .72*fade(pivot-rate/10, pivot)) * (1 - fade(pivot, finish-1)),
-		}
+		gains := gainsAt(from + time.Duration(i-begin)*time.Second/time.Duration(s.rate))
 		source := i
 		if i >= seam {
 			source -= length
@@ -171,15 +196,28 @@ func renderAutomixLoop(c automixLoopCut, t *beatTimeline, rate, first int, dry [
 			}
 			for ch := range 2 {
 				sample := read(source, stem, ch)
-				if i >= seam-edge && i < seam {
-					blend := fade(seam-edge, seam)
+				if length != 0 && i >= seam-edge && i < seam {
+					blend := float32(automixRampProgress(int64(i), int64(seam-edge), int64(seam)))
 					sample += blend * (read(i-length, stem, ch) - sample)
 				}
-				audio.frames[i-begin][stem*2+ch] = gain * sample
+				a.frames[i-begin][stem*2+ch] = gain * sample
 			}
 		}
 	}
-	return audio
+	return a
+}
+
+func renderAutomixLoop(c automixLoopCut, t *beatTimeline, rate, first int, dry []float32, split [][2 * demucsOther]float32) *automixLoopAudio {
+	s := automixStemSource{t, rate, first, dry, split}
+	begin, pivot := c.end-c.voice, c.target()
+	return s.render(begin, pivot+automixLoopTail, c, false, func(at time.Duration) [demucsStemCount]float32 {
+		return [demucsStemCount]float32{
+			1 - nativeRamp(at, begin, c.end-automixLoopSeam),
+			1 - nativeRamp(at, pivot-75*time.Millisecond, pivot),
+			1 - nativeRamp(at, pivot-240*time.Millisecond, pivot),
+			(1 - .72*nativeRamp(at, pivot-100*time.Millisecond, pivot)) * (1 - nativeRamp(at, pivot, pivot+automixLoopTail)),
+		}
+	})
 }
 
 // Supply the pre-separated repeat before the ordinary Dolby processing path.
@@ -188,6 +226,12 @@ func (a *automixLoopAudio) apply(stereo, bed, weights []float32, first int64, ga
 	for i := int(max(0, a.first-first)); i < len(stereo)/2; i++ {
 		at := int(first-a.first) + i
 		blend := float32(automixRampProgress(int64(at), 0, int64(edge)))
+		if a.resume {
+			if at >= len(a.frames) {
+				break
+			}
+			blend = float32(automixRampProgress(int64(len(a.frames)-at), 0, int64(edge)))
+		}
 		var mix [2]float32
 		if at < len(a.frames) {
 			for stem, gain := range gains {

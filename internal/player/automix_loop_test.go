@@ -130,7 +130,7 @@ func TestAutomixSchedulesPreparedLoop(t *testing.T) {
 	loop := &automixLoopAudio{cut: cut, rate: s.SampleRate()}
 	quality := p.playbackQuality()
 	next := &nextRhythm{source: "s", id: "b", quality: quality, cancel: func() {}}
-	next.pair.Store(&automixPair{out: old, in: in, loop: loop})
+	next.pair.Store(&automixPair{out: old, in: in, loop: loop, stemsReady: true})
 	p.nextRhythm = next
 	done := make(chan struct{})
 	close(done)

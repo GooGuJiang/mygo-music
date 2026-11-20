@@ -18,9 +18,11 @@ type automixStem struct {
 }
 
 type automixPair struct {
-	out, in    *beatTimeline
-	stemsReady bool
-	loop       *automixLoopAudio
+	out, in     *beatTimeline
+	stemsReady  bool
+	nativeReady bool
+	loop        *automixLoopAudio
+	native      *automixNativeMix
 }
 
 func analyzeAutomixPair(ctx context.Context, engine *demucsEngine, out, in stream, end time.Duration, publish func(*automixPair)) {
@@ -38,8 +40,7 @@ func analyzeAutomixPair(ctx context.Context, engine *demucsEngine, out, in strea
 		return
 	}
 	matched := matchBars(a, b, end, 0).count > 0
-	loopable := !matched && a.end+100*time.Millisecond >= end
-	if !matched && !loopable {
+	if a.end+100*time.Millisecond < end {
 		publish(&automixPair{out: a, in: b, stemsReady: true})
 		return
 	}
@@ -48,34 +49,41 @@ func analyzeAutomixPair(ctx context.Context, engine *demucsEngine, out, in strea
 	rateA, rateB := out.SampleRate(), in.SampleRate()
 	stemsA := make([]automixStem, len(dryA)/(2*(rateA/20)))
 	stemsB := make([]automixStem, len(dryB)/(2*(rateB/20)))
-	// For loop candidates, keep the last two spans plus room on each side of the wrap.
-	var split [][2 * demucsOther]float32
-	first := len(dryA) / 2
-	if loopable {
-		first = max(0, first-16*rateA)
-		split = make([][2 * demucsOther]float32, len(dryA)/2-first)
-	}
+	first := max(0, len(dryA)/2-int(automixNativeLookback/time.Second)*rateA)
+	old := automixStemSource{timeline: a, rate: rateA, first: first, dry: dryA,
+		split: make([][2 * demucsOther]float32, len(dryA)/2-first)}
+	next := automixStemSource{timeline: b, rate: rateB, dry: dryB,
+		split: make([][2 * demucsOther]float32, min(len(stemsB), int(automixNativeIntro/automixFeatureStep))*(rateB/20))}
 	var loop *automixLoopAudio
+	var native *automixNativeMix
+	nativeReady := false
 	const block = 40 // Two seconds of features fit one padded Demucs request.
 	for offset := 0; offset < max(len(stemsA), len(stemsB)) && ctx.Err() == nil; offset += block {
 		// Start with the end of the outgoing song and the beginning of the incoming song.
 		aEnd, bStart := max(0, len(stemsA)-offset), min(offset, len(stemsB))
 		aStart, bEnd := max(0, aEnd-block), min(bStart+block, len(stemsB))
-		okA := analyzeAutomixStemBlock(ctx, engine, dryA, rateA, aStart, stemsA[aStart:aEnd], first, split)
-		okB := analyzeAutomixStemBlock(ctx, engine, dryB, rateB, bStart, stemsB[bStart:bEnd], 0, nil)
+		okA := analyzeAutomixStemBlock(ctx, engine, old, aStart, stemsA[aStart:aEnd], true)
+		okB := analyzeAutomixStemBlock(ctx, engine, next, bStart, stemsB[bStart:bEnd], false)
 		if ctx.Err() != nil {
 			return
 		}
 		finished := offset+block >= max(len(stemsA), len(stemsB)) || !okA || !okB
 		withStemsA, withStemsB := *a, *b
 		withStemsA.stems, withStemsB.stems = slices.Clone(stemsA), slices.Clone(stemsB)
-		if loopable {
+		if !matched {
 			cut := planAutomixLoop(&withStemsA, &withStemsB, end)
 			if cut.end > cut.start && (loop == nil || loop.cut != cut) {
-				loop = renderAutomixLoop(cut, a, rateA, first, dryA, split)
+				loop = renderAutomixLoop(cut, a, rateA, old.first, dryA, old.split)
 			}
 		}
-		publish(&automixPair{out: &withStemsA, in: &withStemsB, stemsReady: finished, loop: loop})
+		// Score both kinds of outgoing cue after enough audio to cover the longest loop.
+		if !nativeReady && (finished || aStart*(rateA/20) <= old.first && bEnd*(rateB/20) >= len(next.split)) {
+			nativeReady = true
+			if cut := planAutomixNative(&withStemsA, &withStemsB, end); cut.lead > 0 {
+				native = renderAutomixNative(cut, old, next)
+			}
+		}
+		publish(&automixPair{out: &withStemsA, in: &withStemsB, stemsReady: finished, nativeReady: nativeReady, loop: loop, native: native})
 		if finished {
 			return
 		}
@@ -178,10 +186,11 @@ func (t *beatTimeline) phraseScores(bars []int) []float64 {
 	return scores
 }
 
-func analyzeAutomixStemBlock(ctx context.Context, engine *demucsEngine, pcm []float32, rate, first int, stems []automixStem, splitFirst int, split [][2 * demucsOther]float32) bool {
+func analyzeAutomixStemBlock(ctx context.Context, engine *demucsEngine, source automixStemSource, first int, stems []automixStem, reverse bool) bool {
 	if len(stems) == 0 {
 		return true
 	}
+	pcm, rate := source.dry, source.rate
 	hop, pad := rate/20, rate/8
 	start, end := first*hop, (first+len(stems))*hop
 	lo, hi := max(0, start-pad), min(end+pad, len(pcm)/2)
@@ -189,17 +198,22 @@ func analyzeAutomixStemBlock(ctx context.Context, engine *demucsEngine, pcm []fl
 	if result.err != nil || len(result.bed) != (hi-lo)*demucsFrameSamples {
 		return false
 	}
-	// The outgoing blocks arrive from the tail back. Blend this block's padding into its already separated neighbor.
-	for i := max(start, splitFirst); i < min(hi, splitFirst+len(split), len(pcm)/2/hop*hop); i++ {
+	// Blend the padding into the neighbor already analyzed in this direction.
+	captureLo, captureHi := lo, end
+	if reverse {
+		captureLo, captureHi = start, min(hi, len(pcm)/2/hop*hop)
+	}
+	for i := max(captureLo, source.first); i < min(captureHi, source.first+len(source.split)); i++ {
 		x := result.bed[(i-lo)*demucsFrameSamples+atmosPCMChannels:]
-		dst := &split[i-splitFirst]
-		if i < end {
-			copy(dst[:], x[:2*demucsOther])
-		} else {
-			blend := float32(automixRampProgress(int64(i), int64(end), int64(hi)))
-			for ch := range dst {
-				dst[ch] = x[ch] + blend*(dst[ch]-x[ch])
-			}
+		dst := &source.split[i-source.first]
+		keep := float32(0)
+		if i < start {
+			keep = 1 - float32(automixRampProgress(int64(i), int64(lo), int64(start)))
+		} else if i >= end {
+			keep = float32(automixRampProgress(int64(i), int64(end), int64(hi)))
+		}
+		for ch := range dst {
+			dst[ch] = x[ch] + keep*(dst[ch]-x[ch])
 		}
 	}
 	backing := make([]float32, 2*(hi-lo))

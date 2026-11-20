@@ -35,9 +35,9 @@ func (w *watched) setAutomix(plan *automixPlan, incoming bool) {
 	var stems *automixStemEnvelope
 	var loop *automixLoopAudio
 	if plan != nil {
-		if plan.loop != nil {
-			if !incoming && plan.loop.rate == w.SampleRate() {
-				loop = plan.loop
+		if plan.preparedAudio(false) != nil {
+			if prepared := plan.preparedAudio(incoming); prepared != nil && prepared.rate == w.SampleRate() {
+				loop = prepared
 			}
 		} else {
 			rate := w.SampleRate()

@@ -135,8 +135,13 @@ func (p *Player) scheduleAutomix(out *audio.Player) {
 				}
 				if p.automixPrep == nil && p.nextRhythm != nil && !missedCue {
 					if pair := p.nextRhythm.pair.Load(); pair != nil {
-						plan := matchBars(pair.out, pair.in, out.Duration(), position)
-						if plan.count == 0 {
+						var plan automixPlan
+						if native := pair.native; native != nil && p.watch != nil && p.watch.rhythm == s && native.out.rate == p.watch.SampleRate() &&
+							position+automixLoopDecodeLead < time.Duration(float64(native.out.first)*float64(time.Second)/float64(native.out.rate)) {
+							cut := native.cut
+							plan = automixPlan{bridge: true, target: cut.outBeat - cut.lead, cue: cut.inBeat - cut.lead,
+								overlap: cut.lead + cut.tail, pivot: cut.lead, native: native}
+						} else if plan = matchBars(pair.out, pair.in, out.Duration(), position); plan.count == 0 {
 							if loop := pair.loop; loop != nil && p.watch != nil && p.watch.rhythm == s && loop.rate == p.watch.SampleRate() &&
 								position+automixLoopDecodeLead < loop.cut.end-loop.cut.voice {
 								plan = automixPlan{bridge: true, cue: loop.cut.cue, target: loop.cut.target(), overlap: automixLoopTail, loop: loop}
@@ -146,7 +151,7 @@ func (p *Player) scheduleAutomix(out *audio.Player) {
 						}
 						// Give stem analysis time to finish without missing a usable downbeat.
 						rampDue := plan.count > 0 && plan.bars[0].speed != 1 && plan.rampStart-position <= time.Second
-						if plan.timed() && (plan.loop != nil || pair.stemsReady || rampDue || plan.target-position <= 5*time.Second) {
+						if plan.timed() && (plan.native != nil || plan.loop != nil && pair.nativeReady || pair.stemsReady || rampDue || plan.target-position <= 5*time.Second) {
 							if !pair.stemsReady {
 								p.nextRhythm.cancel()
 							}

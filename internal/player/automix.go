@@ -33,9 +33,26 @@ type automixPlan struct {
 	bridge               bool
 	stems                automixStemTiming
 	loop                 *automixLoopAudio
+	native               *automixNativeMix
 }
 
 func (m *automixPlan) timed() bool { return m != nil && (m.count > 0 || m.bridge) }
+
+func (m *automixPlan) preparedAudio(incoming bool) *automixLoopAudio {
+	if m == nil {
+		return nil
+	}
+	if m.native != nil {
+		if incoming {
+			return m.native.in
+		}
+		return m.native.out
+	}
+	if incoming {
+		return nil
+	}
+	return m.loop
+}
 
 type automixPreparation struct {
 	plan  automixPlan

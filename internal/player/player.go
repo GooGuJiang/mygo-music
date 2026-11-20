@@ -924,14 +924,19 @@ func (p *Player) loadTrack(at, skipped, dir int, play bool, from, overlap time.D
 						atCue := (p.out.Position() - mix.cue).Abs() < time.Millisecond
 						ready := buffered && p.handoff == outgoing && outgoing.Playing() && p.Automix() && s.Channels() == 2 &&
 							atCue && (p.Dolby == nil || !p.Dolby().Spatial)
+						late := 110 * time.Millisecond
+						if mix.native != nil {
+							ready = ready && p.watch.rhythm != nil && mix.native.in.rate == s.SampleRate()
+							late = 45 * time.Millisecond
+						}
 						if ready && wait > 5*time.Millisecond {
 							p.after(time.Duration(float64(wait)/outgoing.Speed()), func() { p.post(func() { begin(buffered) }) })
 							return
 						}
-						if !ready || wait < -110*time.Millisecond {
+						if !ready || wait < -late {
 							p.watch.setAutomix(nil, true)
-							if mix.loop != nil {
-								// The repeat is already in the outgoing buffers. Let its tail finish while the new track fades in.
+							if mix.preparedAudio(false) != nil {
+								// The prepared audio is already buffered. Let its tail play under the fallback fade.
 								overlap = max(trackHandoffFade, mix.overlap+wait)
 							} else {
 								overlap = automixOverlap

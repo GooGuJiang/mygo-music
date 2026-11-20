@@ -1,7 +1,9 @@
 package app
 
 import (
+	"log"
 	"math"
+	"strconv"
 	"time"
 
 	"github.com/egoist/mygo/plugins/glass"
@@ -35,6 +37,11 @@ func (a *app) scrubber(c *ui.Context, st *scrubState, track, fill ui.Color, heig
 		st.v = pl.Position().Seconds()
 	}
 	s := ui.SliderBase(c, &st.v, 0, max(dur, 1)).Height(height).FocusRing(false).Label(T("Progress")).Cursor(ui.CursorPointer)
+	point, estimated, hasPoint := pl.AutomixPoint()
+	if hasPoint {
+		s.Description(automixPointLabel(point, estimated))
+	}
+	marker := a.pal.accent
 	// The press and its release come to the bar wherever the pointer is,
 	// and go on to the slider, which follows the pointer.
 	s.HandleInput(func(ev ui.InputEvent) bool {
@@ -107,6 +114,14 @@ func (a *app) scrubber(c *ui.Context, st *scrubState, track, fill ui.Color, heig
 			p.Fill(ui.Rect{X: head - core/2, Y: cy - core/2, W: core, H: core}, white.Mix(smoke, 0.15).Alpha(smoking), core/2)
 		} else {
 			p.Fill(played, fill, thick/2)
+		}
+		if hasPoint && dur > 0 {
+			x := r.X + r.W*float32(min(1, max(0, point.Seconds()/dur)))
+			if estimated {
+				p.Stroke(ui.Rect{X: x - 2, Y: cy - 5, W: 4, H: 10}, marker, 2, 1.5)
+			} else {
+				p.Fill(ui.Rect{X: x - 1.5, Y: cy - 5, W: 3, H: 10}, marker, 1.5)
+			}
 		}
 		if knob > 0.01 {
 			k := 12 * knob
@@ -224,7 +239,7 @@ func (a *app) nativeVolumeSlider(c *ui.Context, pop popover) {
 	s := ui.SliderBase(c.Key("volume"), &a.volume, 0, 1).Vertical().Size(knob+8, 124).PaddingY(knob / 2).
 		Step(0.01).AutoFocus().FocusRing(false).Label(T("Volume"))
 	if s.Changed() {
-		a.pl.SetVolume(a.volume)
+		a.volumeChanged()
 	}
 	s.HandleInput(func(ev ui.InputEvent) bool { return a.scrollVolume(ev) })
 	pressed := s.Pressed()
@@ -251,6 +266,31 @@ func (a *app) nativeVolumeSlider(c *ui.Context, pop popover) {
 // wheelVolumeStep is how much one mouse-wheel event turns the volume.
 const wheelVolumeStep = 0.03
 
+const volumeSaveDelay = 200 * time.Millisecond
+
+func (a *app) applySavedVolumes() {
+	a.volume = a.settings.Volume
+	a.pl.SetVolume(a.volume)
+	a.pl.SetMetronomeVolume(a.settings.MetronomeVolume)
+}
+
+func (a *app) volumeChanged() {
+	a.pl.SetVolume(a.volume)
+	if a.settings.Volume != a.volume {
+		a.settings.Volume = a.volume
+		a.volumesDirty = true
+	}
+}
+
+func (a *app) saveVolumes() {
+	a.volumesDirty = false
+	a.volumeSaveAt = time.Time{}
+	a.settings.Volume = a.volume
+	if err := a.settings.save(); err != nil {
+		log.Printf("saving volume settings: %v", err)
+	}
+}
+
 // scrollVolume turns the volume up as the wheel or the fingers scroll up.
 // Fingers on a touchpad turn it as far as they scroll; a mouse wheel turns
 // it a fixed step per event, as how far a notch scrolls depends on the
@@ -261,7 +301,7 @@ func (a *app) scrollVolume(ev ui.InputEvent) bool {
 		return false
 	}
 	a.volume = min(1, max(0, a.volume-volumeScroll(ev)))
-	a.pl.SetVolume(a.volume)
+	a.volumeChanged()
 	return true
 }
 
@@ -303,7 +343,7 @@ func (a *app) muteButton(c *ui.Context, color ui.Color) {
 		} else {
 			a.volume = max(a.mutedFrom, 0.5)
 		}
-		a.pl.SetVolume(a.volume)
+		a.volumeChanged()
 	}
 }
 
@@ -313,7 +353,7 @@ func (a *app) volumeSlider(c *ui.Context, color, track ui.Color, width float32) 
 		a.muteButton(c, color)
 		s := ui.SliderBase(c.Key("volume"), &a.volume, 0, 1).Width(width).Height(16).FocusRing(false).Label(T("Volume"))
 		if s.Changed() {
-			a.pl.SetVolume(a.volume)
+			a.volumeChanged()
 		}
 		hot := s.Hovered() || s.Pressed()
 		thick := float32(4)
@@ -376,18 +416,26 @@ func (a *app) playerBar(c *ui.Context) {
 		Material(glass.ScrollEdge{Hard: true, Bottom: true, Background: p.bg})
 	edge.Opacity(edgeShown(edge, a.underBottom))
 	// The controls keep the middle, between sides that share what is left:
-	// narrower, the middle gives up to 140 DIPs, and what plays keeps room
+	// narrower, the middle shrinks, and what plays keeps room
 	// for its cover, some of its title and its heart.
-	const controls = 3*32 + 2*4 // lyrics, queue and the speaker
-	ui.Row(c).Absolute().Left(0).Right(0).Bottom(0).Height(playerBarHeight).PaddingX(20).Gap(20).AlignItems(ui.Center).Children(func() {
+	const barPadding, barGap, trackWidth = 20, 20, 150
+	controls, middleMin, trackMin := float32(3*32+2*4), float32(300), float32(trackWidth) // lyrics, queue and speaker
+	middleWidth := float32(440)
+	if dolbySupported {
+		controls += 3*(32+4) + 62
+		middleMin, trackMin = 192, 102
+		width, _ := c.Size()
+		middleWidth = min(middleWidth, max(middleMin, width-sidebarWidth-2*(barPadding+barGap)-controls-trackWidth))
+	}
+	ui.Row(c).Absolute().Left(0).Right(0).Bottom(0).Height(playerBarHeight).PaddingX(barPadding).Gap(barGap).AlignItems(ui.Center).Children(func() {
 		// What plays.
-		ui.Row(c).Grow(1).Basis(0).MinWidth(150).Children(func() {
+		ui.Row(c).Grow(1).Basis(0).MinWidth(trackMin).Children(func() {
 			if tr == nil {
-				ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
-					ui.Box(c).Size(48, 48).Radius(8).Background(p.hover).Center().Children(func() {
+				ui.Row(c).Shrink(1).MinWidth(0).Gap(12).AlignItems(ui.Center).Children(func() {
+					ui.Box(c).Size(48, 48).Shrink(0).Radius(8).Background(p.hover).Center().Children(func() {
 						ui.Icon(c, iconNote).Size(18, 18).TextColor(p.faint)
 					})
-					ui.Text(c, T("Not Playing")).FontSize(13).TextColor(p.muted)
+					ui.Text(c, T("Not Playing")).Shrink(1).MinWidth(0).SingleLine().FontSize(13).TextColor(p.muted)
 				})
 				return
 			}
@@ -437,7 +485,7 @@ func (a *app) playerBar(c *ui.Context) {
 		})
 
 		// Controls over the progress.
-		ui.Column(c).Width(440).Shrink(1).MinWidth(300).Gap(0).AlignItems(ui.Stretch).Children(func() {
+		ui.Column(c).Width(middleWidth).Shrink(1).MinWidth(middleMin).Gap(0).AlignItems(ui.Stretch).Children(func() {
 			a.transport(c, p.text, p.muted, p.accent, 18)
 			ui.Row(c).Gap(10).AlignItems(ui.Center).Margin(-4, 0, 0, 0).Children(func() {
 				ui.Text(c, clock(pl.Position())).FontSize(10.5).FontFeatures("tnum").TextColor(p.faint).Width(34).TextAlign(ui.End)
@@ -462,7 +510,148 @@ func (a *app) playerBar(c *ui.Context) {
 			if iconButton(c.Key("queue"), iconQueue, 16, p.muted, T("Queue")).Clicked() && tr != nil {
 				a.nowPlaying, a.npPane = true, paneQueue
 			}
+			if dolbySupported {
+				a.rhythmButtons(c)
+				a.dolbyButton(c)
+			}
 			a.volumeButton(c, p.text.Alpha(0.75))
 		})
 	})
+}
+
+func (a *app) rhythmButtons(c *ui.Context) {
+	p := a.pal
+	tempo := "— BPM"
+	if bpm := a.pl.BPM(); bpm > 0 {
+		tempo = strconv.Itoa(bpm) + " BPM"
+	}
+	ui.Text(c.Key("bpm"), tempo).FontSize(10.5).FontFeatures("tnum").TextColor(p.muted).Width(58).TextAlign(ui.End)
+	mix, mixLabel := p.faint, T("Enable Automix")
+	switch {
+	case a.pl.AutomixActive():
+		mix, mixLabel = p.accent, T("Automix in progress")
+	case a.settings.Automix:
+		mix, mixLabel = p.text, T("Disable Automix")
+	}
+	automix := iconButton(c.Key("automix"), iconAutomix, 16, mix, mixLabel)
+	if automix.Clicked() {
+		a.settings.Automix = !a.settings.Automix
+		a.changed()
+	}
+	a.playerHoverPanel(c, automix, "automix-info", T("Automix"), &a.automixInfoOpen, func() bool {
+		a.automixDetails(c)
+		return false
+	})
+	click, clickLabel := p.muted, T("Enable Metronome")
+	if a.pl.Metronome() {
+		click, clickLabel = p.accent, T("Disable Metronome")
+	}
+	b := iconButton(c.Key("metronome"), iconMetronome, 16, click, clickLabel)
+	if b.Clicked() {
+		a.pl.SetMetronome(!a.pl.Metronome())
+	}
+	if !a.pl.Metronome() {
+		a.metronomeVolumeOpen = false
+		return
+	}
+	a.playerHoverPanel(c, b, "metronome-volume-popover", T("Metronome Volume"), &a.metronomeVolumeOpen, func() bool {
+		var keep bool
+		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+			volume := a.pl.MetronomeVolume()
+			s := ui.Slider(c.Key("metronome-volume"), &volume, 0, player.MetronomeMaxVolume).
+				Width(104).Step(0.01).Label(T("Metronome Volume"))
+			if volume != a.pl.MetronomeVolume() {
+				a.pl.SetMetronomeVolume(volume)
+				a.settings.MetronomeVolume = volume
+				a.volumesDirty = true
+			}
+			ui.Textf(c, "%d%%", int(volume*100+0.5)).Width(30).TextAlign(ui.End).
+				FontSize(11).FontWeight(500).FontFeatures("tnum").TextColor(p.muted)
+			_, pressed := s.PressedButton()
+			keep = pressed || s.FocusVisible()
+		})
+		return keep
+	})
+}
+
+func (a *app) playerHoverPanel(c *ui.Context, button ui.Element, key, label string, open *bool, body func() bool) {
+	trigger := button.Hovered() || button.FocusVisible()
+	if !trigger && !*open {
+		return
+	}
+	pop := popoverColors(a.pal.dark)
+	ui.Overlay(c, func() {
+		// Touch the button so the pointer can reach the panel without leaving both.
+		panel := ui.Column(c.Key(key)).AttachTo(button, ui.AnchorTop, ui.AnchorBottom).
+			Padding(8, 12).Radius(12).Background(pop.fill).Border(0.5, pop.edge).
+			Shadow(0, 8, 24, -4, ui.RGBA(0, 0, 0, 0.2)).Role(ui.RoleGroup).Label(label)
+		var keep bool
+		panel.Children(func() { keep = body() })
+		hovered := panel.Hovered()
+		*open = trigger || hovered || keep
+		if !*open {
+			c.Invalidate()
+		}
+	})
+}
+
+func (a *app) automixDetails(c *ui.Context) {
+	info := a.pl.AutomixInfo()
+	status := T("Waiting for the next ready track")
+	switch {
+	case info.Active && info.Bars > 0:
+		status = T("Beat-matched crossfade")
+	case info.Active && info.Bridge:
+		status = T("Original-tempo transition")
+	case info.Active:
+		status = T("Standard crossfade")
+	case !a.settings.Automix:
+		status = T("Automix is off")
+	case info.Queued && info.Bars > 0:
+		status = T("Preparing beat match")
+	case info.Queued && info.Bridge:
+		status = T("Preparing original-tempo transition")
+	case info.Queued:
+		status = T("Preparing standard crossfade")
+	case a.settings.dolbyProfile().Spatial:
+		status = T("Automix needs stereo playback")
+	case info.PreloadFailed:
+		status = T("Could not preload the next track")
+	case info.Preloading && info.Progress > 0:
+		status = Tf("Preloading the next track · %d%%", int(info.Progress*100))
+	case info.Preloading:
+		status = T("Preloading the next track")
+	case info.Ready:
+		status = T("Next track ready")
+	case info.Next == "":
+		status = T("No next track")
+	}
+	if info.Preloading && a.settings.Automix {
+		c.After(400 * time.Millisecond)
+	}
+	p := a.pal
+	ui.Column(c).Width(196).Gap(4).Children(func() {
+		ui.Text(c, status).FontSize(12).FontWeight(600).TextColor(p.text)
+		if info.Next != "" && a.settings.Automix {
+			ui.Text(c, Tf("Next up · %s", info.Next)).SingleLine().FontSize(11).TextColor(p.muted)
+		}
+		if info.Estimated || info.Queued {
+			ui.Text(c, automixPointLabel(info.Start, info.Estimated)).FontSize(11).TextColor(p.muted)
+		}
+		if info.Bars > 0 {
+			ui.Textf(c, "%.1f → %.1f BPM", info.FromBPM, info.ToBPM).FontFeatures("tnum").FontSize(11).TextColor(p.muted)
+			ui.Text(c, Tf("Crossfade %.1f s · %d beats", info.Overlap.Seconds(), info.Beats)).FontSize(11).TextColor(p.muted)
+			ui.Text(c, Tf("Next track cue %s", clock(info.Cue))).FontSize(11).TextColor(p.muted)
+		} else if info.Queued {
+			ui.Text(c, Tf("Crossfade %.1f s", info.Overlap.Seconds())).FontSize(11).TextColor(p.muted)
+			ui.Text(c, Tf("Next track cue %s", clock(info.Cue))).FontSize(11).TextColor(p.muted)
+		}
+	})
+}
+
+func automixPointLabel(point time.Duration, estimated bool) string {
+	if estimated {
+		return Tf("Estimated transition at %s", clock(point))
+	}
+	return Tf("Transition at %s", clock(point))
 }

@@ -1,6 +1,7 @@
 package player
 
 import (
+	"context"
 	"errors"
 	"math"
 	"math/rand/v2"
@@ -40,6 +41,18 @@ type Player struct {
 	// Normalize reports whether to even out the loudness of tracks, as
 	// the settings say.
 	Normalize func() bool
+	// Dolby returns the current settings for the AAF Dolby Audio processor.
+	Dolby func() DolbyProfile
+	// Automix enables automatic crossfades between queued tracks.
+	Automix func() bool
+	// Demucs selects the AI spatial upmix device for ordinary tracks.
+	Demucs func() DemucsMode
+	// DemucsClarity enables high-frequency compensation on the rendered Demucs bed.
+	DemucsClarity func() bool
+	// DemucsMix adjusts the separated stems before rendering.
+	DemucsMix func() DemucsMix
+	// DemucsPositioning enables adaptive stem placement in the AAF bed.
+	DemucsPositioning func() bool
 	// Cache keeps the songs played, if set.
 	Cache *Cache
 	// Changed, if set, hears that what plays, where it is or whether it
@@ -61,17 +74,26 @@ type Player struct {
 	feeding  bool // the feed is asked
 	awaiting bool // at the queue's end, for what the feed gives
 
-	track   *music.Track
-	out     *audio.Player
-	stream  stream
-	watch   *watched // stream, as out plays it
-	info    *music.Stream // what the current track streams
-	fade    fader
-	gain    float64 // the current track's normalizing gain
-	loading bool
-	playing bool // what the listener wants: false while paused
-	err     string
-	gen     int // counts loads, to drop the results of stale ones
+	track             *music.Track
+	out               *audio.Player
+	handoff           *audio.Player
+	automixPrep       *automixPreparation
+	automixMix        *automixPlan
+	nextRhythm        *nextRhythm
+	metronome         bool
+	metronomeVolume   float64
+	stream            stream
+	watch             *watched // stream, as out plays it
+	dolby             DolbyProcessing
+	demucsUnavailable bool
+	info              *music.Stream // what the current track streams
+	fade              fader
+	gain              float64 // the current track's normalizing gain
+	loading           bool
+	playing           bool // what the listener wants: false while paused
+	err               string
+	gen               int // counts loads, to drop the results of stale ones
+	cancelOpen        context.CancelFunc
 
 	lyrics       []lyrics.Line
 	lyricsLoaded bool
@@ -98,11 +120,14 @@ type Player struct {
 
 	recorded string // the track last told its source it played
 
-	ahead *ahead // the next track's audio, asked for before its turn
+	ahead         *ahead // the next track's audio, asked for before its turn
+	demucs        *demucsEngine
+	demucsContext context.Context
+	cancelDemucs  context.CancelFunc
 }
 
 func New(post func(func())) *Player {
-	p := &Player{post: post, at: -1, volume: 0.8, gain: 1}
+	p := &Player{post: post, at: -1, volume: 0.8, gain: 1, metronomeVolume: 1}
 	p.after = func(d time.Duration, fn func()) { time.AfterFunc(d, fn) }
 	p.now = time.Now
 	// Music, mixed far enough ahead to play on while macOS keeps the app
@@ -259,6 +284,7 @@ func (p *Player) EndRadio() {
 			p.order[i] = i
 		}
 	}
+	p.refreshAhead()
 	if awaiting {
 		// At its end, waiting for more: nothing plays on.
 		p.playing = false
@@ -321,6 +347,7 @@ func (p *Player) appendTracks(tracks []music.Track) {
 			p.queue = append(p.queue, t)
 		}
 	}
+	p.refreshAhead()
 }
 
 // shuffleOrder puts the order in a random one with first at its head, or
@@ -349,9 +376,13 @@ func (p *Player) ToggleShuffle() {
 		}
 		p.at = cur
 	}
+	p.refreshAhead()
 }
 
-func (p *Player) CycleRepeat() { p.repeat = (p.repeat + 1) % 3 }
+func (p *Player) CycleRepeat() {
+	p.repeat = (p.repeat + 1) % 3
+	p.refreshAhead()
+}
 
 // Current returns the track playing or loading, or nil.
 func (p *Player) Current() *music.Track { return p.track }
@@ -361,6 +392,61 @@ func (p *Player) Queue() []music.Track { return p.queue }
 
 // Playing reports what the listener wants: false while paused.
 func (p *Player) Playing() bool { return p.playing }
+
+// DolbyStatus reports whether this track has started Dolby Audio processing.
+func (p *Player) DolbyStatus() (active, tried bool) {
+	if p.dolby.Pending {
+		return false, false
+	}
+	return p.dolby.Active, p.dolby.Profile.enabled()
+}
+
+// DolbyProcessing returns the last decoder status on the main thread.
+func (p *Player) DolbyProcessing() DolbyProcessing {
+	return p.dolby
+}
+
+// DolbyAtmos reports whether the track has a decoded Atmos object presentation.
+func (p *Player) DolbyAtmos() bool {
+	s, ok := p.stream.(*codecPCM)
+	return ok && s.format.channels == atmosPCMChannels
+}
+
+// DemucsStatus describes the current track's asynchronous stem processing.
+func (p *Player) DemucsStatus() DemucsStatus {
+	s, ok := p.stream.(*demucsStream)
+	if !ok {
+		if p.demucs != nil && (p.track == nil || p.loading) {
+			return p.demucs.status()
+		}
+		return DemucsStatus{Requested: p.demucsUnavailable, Failed: p.demucsUnavailable}
+	}
+	state := s.engine.status()
+	if stats := s.processing.Load(); stats != nil {
+		state.Active, state.Device, state.Speed = true, stats.device, stats.speed
+	}
+	state.Failed = state.Failed || s.failed.Load()
+	return state
+}
+
+// ApplyDolby queues a profile switch on the decoder goroutine.
+func (p *Player) ApplyDolby() {
+	if p.watch == nil || p.Dolby == nil {
+		return
+	}
+	d, ok := p.watch.stream.(*dolbyStream)
+	if !ok {
+		return
+	}
+	d.clarityOn.Store(p.DemucsClarity != nil && p.DemucsClarity())
+	p.applyDemucsMix()
+	profile := p.Dolby()
+	if *d.requested.Load() == profile {
+		return
+	}
+	d.requested.Store(&profile)
+	p.dolby.Pending = true
+}
 
 // Loading reports whether the current track is still loading.
 // Loading reports whether the current track is on its way: loading, or
@@ -446,6 +532,8 @@ func (p *Player) TogglePlay() {
 		p.remoteToggle()
 		return
 	}
+	p.cancelAutomixPrep()
+	p.finishHandoff(p.handoff)
 	if p.out == nil {
 		switch {
 		case p.loading:
@@ -497,6 +585,8 @@ func (p *Player) Seek(t time.Duration) {
 		p.remoteSeek(t)
 		return
 	}
+	p.cancelAutomixPrep()
+	p.finishHandoff(p.handoff)
 	if p.out == nil {
 		p.pending = t
 		return
@@ -532,6 +622,7 @@ func (p *Player) Seek(t time.Duration) {
 }
 
 func (p *Player) SetVolume(v float64) {
+	p.finishHandoff(p.handoff)
 	p.volume = v
 	p.applyGain()
 	if p.remote != nil {
@@ -601,16 +692,45 @@ func (p *Player) Levels() ([Bands]float32, bool) {
 }
 
 func (p *Player) stop() {
+	p.cancelAutomixPrep()
+	p.clearNextRhythm()
+	p.finishHandoff(p.handoff)
+	if p.cancelOpen != nil {
+		p.cancelOpen()
+		p.cancelOpen = nil
+	}
+	if s, ok := p.stream.(*demucsStream); ok {
+		s.cancel()
+	}
 	if out := p.out; out != nil {
-		// Paused first, it fades out over a few milliseconds, rather than
-		// stopping with a click.
-		out.Pause()
-		time.AfterFunc(100*time.Millisecond, out.Close)
+		retireOutput(out)
 	}
 	p.out, p.stream, p.watch, p.info, p.remote = nil, nil, nil, nil, nil
+	p.dolby = DolbyProcessing{}
+	p.demucsUnavailable = false
 	p.seeking = false
 	p.fade.attach(nil, 1)
 }
+
+func retireOutput(out *audio.Player) {
+	// Pausing uses the mixer ramp before Close removes the voice.
+	out.Pause()
+	time.AfterFunc(100*time.Millisecond, out.Close)
+}
+
+func (p *Player) finishHandoff(out *audio.Player) {
+	if out != nil && p.handoff == out {
+		p.handoff = nil
+		p.automixMix = nil
+		p.fade.setHandoff(nil, nil)
+		if p.watch != nil {
+			p.watch.setAutomix(nil, true)
+		}
+		retireOutput(out)
+	}
+}
+
+const trackHandoffFade = 60 * time.Millisecond
 
 // Which way a load goes past a track that can't play: on to the next, back to
 // the one before, or nowhere, staying on it to say why.
@@ -661,13 +781,44 @@ func (p *Player) record() {
 // loadSkipping loads the track at order[at], to play or not, from from,
 // skipping those that cannot play the way dir goes: skipped of them so far.
 func (p *Player) loadSkipping(at, skipped, dir int, play bool, from time.Duration) {
+	p.loadTrack(at, skipped, dir, play, from, trackHandoffFade, nil)
+}
+
+func (p *Player) loadTrack(at, skipped, dir int, play bool, from, overlap time.Duration, mix *automixPlan) {
+	p.cancelAutomixPrep()
 	t := p.queue[p.order[at]]
 	src := p.sourceOf(&t)
 	if was := p.remote; was != nil && was.started && p.playing && (src == nil || src.Info().ID != was.src.Info().ID) {
 		// Whatever plays next isn't its to play.
 		p.command(was.src, was.src.RemotePause)
 	}
+	var outgoing *audio.Player
+	var outgoingWatch *watched
+	if _, demucs := p.stream.(*demucsStream); (mix != nil || demucs && from == 0) && play && p.playing && !p.seeking &&
+		p.out != nil && p.out.Playing() && src != nil && src.Info().Playback != music.PlaybackRemote {
+		outgoing, p.out = p.out, nil
+		outgoingWatch = p.watch
+		if p.watch != nil {
+			p.watch.clickGain.Store(0)
+		}
+		p.stream = nil // the outgoing audio player owns its decoder until the handoff ends
+	}
 	p.stop()
+	if outgoing != nil {
+		p.handoff = outgoing
+		if mix != nil && !mix.timed() {
+			mix = &automixPlan{target: mix.target, overlap: overlap}
+		}
+		p.automixMix = mix
+		// Limit how long the previous song carries the transition for a slow source.
+		p.after(max(750*time.Millisecond, overlap+automixLead), func() {
+			p.post(func() {
+				if p.out == nil || !p.out.Playing() {
+					p.finishHandoff(outgoing)
+				}
+			})
+		})
+	}
 	p.gen++
 	gen := p.gen
 	p.at = at
@@ -686,13 +837,37 @@ func (p *Player) loadSkipping(at, skipped, dir int, play bool, from time.Duratio
 		p.loadRemote(gen, src, at, skipped, dir, play, from)
 		return
 	}
-	quality := music.Qualities[len(music.Qualities)/2]
-	if p.Quality != nil {
-		quality = p.Quality()
-	}
+	quality := p.playbackQuality()
 	pre := p.takeAhead(t, quality)
+	var engine *demucsEngine
+	if t.ShowID == "" {
+		p.PrepareDemucs()
+		engine = p.demucs
+		if engine != nil {
+			engine.retain()
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	p.cancelOpen = cancel
 	go func() {
-		info, s, err := p.open(src, t, quality, pre)
+		available := engine != nil && findDemucs() != ""
+		info, s, err := p.open(ctx, src, t, quality, pre)
+		demucsUnavailable := false
+		if err == nil && engine != nil {
+			if _, native := s.(*codecPCM); !native {
+				rate := s.SampleRate()
+				if available && s.Channels() == 2 && rate >= 32000 && rate <= 192000 {
+					s = newDemucsStream(s, engine, t.Duration)
+					engine = nil // the producer owns this reference
+				} else {
+					demucsUnavailable = true
+				}
+			}
+		}
+		if engine != nil {
+			engine.release()
+		}
+		cancel()
 		p.post(func() {
 			if gen != p.gen {
 				if s != nil {
@@ -700,18 +875,112 @@ func (p *Player) loadSkipping(at, skipped, dir int, play bool, from time.Duratio
 				}
 				return
 			}
+			p.cancelOpen = nil
 			p.loading = false
 			if err != nil {
+				p.finishHandoff(outgoing)
 				p.loadFailed(t.Source, err, at, skipped, dir)
 				return
 			}
 			p.stream, p.info = s, info
+			p.applyDemucsMix()
+			p.demucsUnavailable = demucsUnavailable
 			p.gain = normGain(info)
-			p.watch = &watched{stream: s, now: p.now, ended: func() { p.post(func() {}) }}
+			var decoded stream = s
+			if s.Channels() == 2 && p.Dolby != nil {
+				d := &dolbyStream{stream: s}
+				d.clarityOn.Store(p.DemucsClarity != nil && p.DemucsClarity())
+				profile := p.Dolby()
+				rate := s.SampleRate()
+				p.dolby.Pending = profile.enabled()
+				d.requested.Store(&profile)
+				d.status = func(used *DolbyProfile, active bool, channels int) {
+					p.post(func() {
+						if gen == p.gen && p.out != nil && d.requested.Load() == used {
+							p.dolby = DolbyProcessing{Profile: *used, SampleRate: rate, InputChannels: channels, Active: active}
+						}
+					})
+				}
+				decoded = d
+			}
+			p.watch = &watched{stream: decoded, now: p.now, ended: func() { p.post(func() {}) }}
+			p.watch.rhythm, _ = s.(*demucsStream)
+			p.applyMetronome()
+			waitForFirstRead := outgoing != nil && p.handoff == outgoing
+			if waitForFirstRead {
+				if mix.timed() && s.Channels() == 2 && p.pending == mix.cue {
+					p.watch.setAutomix(mix, true)
+				}
+				if p.pending > 0 {
+					p.watch.firstFrame = int64(math.Round(p.pending.Seconds() * float64(s.SampleRate())))
+				}
+				var begin func(bool)
+				begin = func(buffered bool) {
+					if gen != p.gen || p.out == nil || !p.playing || p.out.Playing() || p.seeking {
+						return
+					}
+					if mix.timed() {
+						wait := mix.target - automixMixPosition(outgoing)
+						atCue := (p.out.Position() - mix.cue).Abs() < time.Millisecond
+						ready := buffered && p.handoff == outgoing && outgoing.Playing() && p.Automix() && s.Channels() == 2 &&
+							atCue && (p.Dolby == nil || !p.Dolby().Spatial)
+						late := 110 * time.Millisecond
+						if mix.native != nil {
+							ready = ready && p.watch.rhythm != nil && mix.native.in.rate == s.SampleRate()
+							late = 45 * time.Millisecond
+						}
+						if ready && wait > 5*time.Millisecond {
+							p.after(time.Duration(float64(wait)/outgoing.Speed()), func() { p.post(func() { begin(buffered) }) })
+							return
+						}
+						if !ready || wait < -late {
+							p.watch.setAutomix(nil, true)
+							if mix.preparedAudio(false) != nil {
+								// The prepared audio is already buffered. Let its tail play under the fallback fade.
+								overlap = max(trackHandoffFade, mix.overlap+wait)
+							} else {
+								overlap = automixOverlap
+								if outgoingWatch != nil {
+									outgoingWatch.setAutomix(nil, false)
+								}
+							}
+							if atCue {
+								p.out.Seek(0)
+							}
+							mix = &automixPlan{target: automixMixPosition(outgoing), overlap: overlap}
+							if p.handoff == outgoing {
+								p.automixMix = mix
+							}
+						}
+					}
+					if p.handoff == outgoing && outgoing.Playing() {
+						duration := overlap
+						if !mix.timed() {
+							remaining := outgoing.Duration() - automixMixPosition(outgoing)
+							duration = min(overlap, max(trackHandoffFade, remaining))
+							if mix != nil {
+								p.automixMix = &automixPlan{target: automixMixPosition(outgoing), overlap: duration}
+							}
+						}
+						p.fade.setHandoff(outgoing, mix)
+						p.fade.fade(1, duration, func() {
+							p.post(func() { p.finishHandoff(outgoing) })
+						})
+					} else {
+						p.finishHandoff(outgoing)
+						p.fade.fade(1, trackHandoffFade, nil)
+					}
+					p.out.Play()
+					p.record()
+				}
+				p.watch.firstRead = func(buffered bool) {
+					p.post(func() { begin(buffered) })
+				}
+			}
 			p.out = audio.NewPlayer(p.watch)
 			// From its middle, as a session picked up again, it fades in.
 			level := 1.0
-			if p.pending > 0 {
+			if p.pending > 0 || waitForFirstRead {
 				level = 0
 			}
 			p.fade.attach(p.out, level)
@@ -727,15 +996,23 @@ func (p *Player) loadSkipping(at, skipped, dir int, play bool, from time.Duratio
 				p.out.Seek(p.pending)
 				p.pending = 0
 			}
-			if p.playing {
+			if p.playing && !waitForFirstRead {
 				p.out.Play()
 				p.fade.fade(1, fadeIn, nil)
 				p.record()
 			}
 			p.sync()
 			p.getAhead(quality)
+			p.scheduleAutomix(p.out)
 		})
 	}()
+}
+
+func (p *Player) playbackQuality() string {
+	if p.Quality != nil {
+		return p.Quality()
+	}
+	return music.Qualities[len(music.Qualities)/2]
 }
 
 // loadCover shows the system the cover of t, once it has it.
@@ -803,6 +1080,10 @@ func errorText(err error) string {
 	switch {
 	case errors.Is(err, errNoSource):
 		return i18n.T("The plugin of this song is gone")
+	case errors.Is(err, errNativeCodec):
+		return i18n.T("Install the MyGo native codec to play Dolby audio")
+	case errors.Is(err, errCodecFailed):
+		return i18n.T("Couldn't decode this audio")
 	case errors.Is(err, music.ErrUnavailable):
 		return i18n.T("This song isn't available")
 	case errors.Is(err, music.ErrSignIn):
@@ -822,7 +1103,7 @@ var errNoSource = errors.New("player: no such source")
 // that worked; or kept in the cache, or else a file on disk, played from
 // there, or else streamed into the cache, and kept once it has all come in.
 // What failed ahead is asked for again: it may have been a moment's.
-func (p *Player) open(src music.Source, t music.Track, quality string, pre *ahead) (*music.Stream, stream, error) {
+func (p *Player) open(ctx context.Context, src music.Source, t music.Track, quality string, pre *ahead) (*music.Stream, stream, error) {
 	if src == nil {
 		if pre != nil {
 			pre.close()
@@ -866,7 +1147,14 @@ func (p *Player) open(src music.Source, t music.Track, quality string, pre *ahea
 			dl = p.Cache.download(t.Source, t.ID, quality, info)
 		}
 	}
-	s, err := openStream(dl, t.Duration)
+	// Cancel the pending download while opening, but let successful playback own it.
+	stopCancel := context.AfterFunc(ctx, dl.Close)
+	s, err := openTrackStream(ctx, dl, t.Duration)
+	stopCancel()
+	if ctx.Err() != nil && err == nil {
+		s.Close()
+		return nil, nil, ctx.Err()
+	}
 	if err != nil {
 		dl.Close()
 		return nil, nil, err
@@ -954,5 +1242,13 @@ func (p *Player) OpenAudio() (Audio, error) {
 		return nil, errors.New("player: nothing loaded")
 	}
 	dl, _ := p.stream.source()
+	if s, ok := p.stream.(*codecPCM); ok {
+		decoded, err := openShared(s.wavStream.dl, p.track.Duration)
+		if err != nil {
+			return nil, err
+		}
+		decoded.(*wavStream).downmix = s.downmix
+		return decoded, nil
+	}
 	return openShared(dl, p.track.Duration)
 }

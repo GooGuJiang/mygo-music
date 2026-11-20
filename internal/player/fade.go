@@ -20,29 +20,80 @@ const (
 // package audio lets any goroutine change a player, and the main thread
 // would redraw the windows with each step.
 type fader struct {
-	mu    sync.Mutex
-	out   *audio.Player
-	gain  float64 // the listener's volume and the track's gain, together
-	from  float64 // the level faded from at start, to to over dur
-	to    float64
-	start time.Time
-	dur   time.Duration
-	gen   int // counts fades, to stop the goroutine of one overtaken
+	mu          sync.Mutex
+	out         *audio.Player
+	handoff     *audio.Player
+	handoffGain float64
+	mix         *automixPlan
+	tempoAt     time.Time
+	gain        float64 // the listener's volume and the track's gain, together
+	from        float64 // the level faded from at start, to to over dur
+	to          float64
+	start       time.Time
+	dur         time.Duration
+	gen         int // counts fades, to stop the goroutine of one overtaken
 }
 
 // level returns the level at now, easing in and out.
 func (f *fader) level(now time.Time) float64 {
 	t := 1.0
 	if f.dur > 0 {
-		t = min(1, now.Sub(f.start).Seconds()/f.dur.Seconds())
+		t = min(1, max(0, now.Sub(f.start).Seconds()/f.dur.Seconds()))
+	}
+	if f.handoff != nil {
+		return f.from + (f.to-f.from)*t
 	}
 	return f.from + (f.to-f.from)*(0.5-0.5*math.Cos(math.Pi*t))
 }
 
 func (f *fader) apply(now time.Time) {
-	if f.out != nil {
-		f.out.SetVolume(f.gain * f.level(now))
+	level := f.level(now)
+	gain := f.gain * level
+	if f.handoff != nil && f.mix.preparedAudio(false) != nil {
+		// Both decks use their decoded stem envelopes where provided.
+		f.out.SetVolume(f.gain)
+		return
 	}
+	if f.handoff != nil {
+		if f.mix != nil && f.mix.bridge {
+			level = f.mix.bridgeProgress(level)
+		}
+		out, in := handoffGains(level, f.handoffGain, f.gain)
+		f.handoff.SetVolume(out)
+		gain = in
+		speed := 1.0
+		if m := f.mix; m != nil && m.count > 0 {
+			_, speed = m.alignment(max(0, now.Sub(f.start)))
+			if heard := f.out.Position() - m.cue; heard > 50*time.Millisecond && heard < m.overlap {
+				want, _ := m.alignment(heard)
+				drift := (want - f.handoff.Position()).Seconds()
+				speed += max(-.025, min(.025, drift/.6))
+			}
+		}
+		current := f.handoff.Speed()
+		if current != speed {
+			f.handoff.SetSpeed(stepAutomixSpeed(current, speed, now.Sub(f.tempoAt)))
+		}
+		f.tempoAt = now
+	}
+	if f.out != nil {
+		f.out.SetVolume(gain)
+	}
+}
+
+func stepAutomixSpeed(current, target float64, elapsed time.Duration) float64 {
+	step := .15 * min(automixTempoTick, max(0, elapsed)).Seconds()
+	return min(current+step, max(current-step, min(automixMaxSpeed, max(automixMinSpeed, target))))
+}
+
+func handoffGains(progress, outgoing, incoming float64) (float64, float64) {
+	// pyCrossfade's equal-power curve interpolates squared gains.
+	out, in := outgoing*math.Sqrt(1-progress), incoming*math.Sqrt(progress)
+	// Reserve headroom for peaks that align when the two tracks overlap.
+	if sum, ceiling := out+in, max(1, outgoing, incoming); sum > ceiling {
+		out, in = out*ceiling/sum, in*ceiling/sum
+	}
+	return out, in
 }
 
 // attach makes out the player faded, at level.
@@ -50,8 +101,25 @@ func (f *fader) attach(out *audio.Player, level float64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.gen++
+	f.handoff, f.mix = nil, nil
 	f.out, f.from, f.to, f.dur = out, level, level, 0
 	f.apply(time.Now())
+}
+
+func (f *fader) setHandoff(out *audio.Player, mix *automixPlan) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.handoff, f.mix = out, nil
+	if out != nil {
+		f.handoffGain = out.Volume()
+		f.tempoAt = time.Now()
+		if mix.timed() {
+			f.mix = mix
+			if mix.count > 0 {
+				out.SetPreservesPitch(true)
+			}
+		}
+	}
 }
 
 // setGain changes the volume and gain, at once.
@@ -82,6 +150,9 @@ func (f *fader) fade(to float64, d time.Duration, done func()) {
 		d = time.Duration(float64(d) * span)
 	}
 	f.from, f.to, f.start, f.dur = from, to, now, d
+	if f.mix.preparedAudio(false) != nil {
+		f.apply(now)
+	}
 	f.mu.Unlock()
 	go func() {
 		tick := time.NewTicker(8 * time.Millisecond)

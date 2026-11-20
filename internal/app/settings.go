@@ -9,6 +9,7 @@ import (
 	"github.com/egoist/mygo"
 
 	"mygo-music/internal/i18n"
+	"mygo-music/internal/player"
 )
 
 // settings are the listener's choices, kept in settings.json in the user
@@ -66,10 +67,19 @@ type settings struct {
 	// whatever its style.
 	StageSparks bool `json:"stageSparks,omitempty"`
 	// Volume is where the volume was left, from 0 to 1.
-	Volume float64 `json:"volume"`
+	Volume          float64 `json:"volume"`
+	MetronomeVolume float64 `json:"metronomeVolume"`
 	// Normalize evens out the loudness of tracks, by what their source
 	// measured of each.
 	Normalize bool `json:"normalize"`
+	// Dolby processes music in the player when a compatible Windows APO is installed.
+	Dolby             bool              `json:"dolby"`
+	DolbyEffect       dolbySelection    `json:"dolbyEffect"`
+	Automix           bool              `json:"automix,omitempty"`
+	DemucsMode        player.DemucsMode `json:"demucsMode,omitempty"`
+	DemucsClarity     bool              `json:"demucsClarity,omitempty"`
+	DemucsMix         player.DemucsMix  `json:"demucsMix,omitzero"`
+	DemucsPositioning bool              `json:"demucsPositioning"`
 	// HotComments shows a song's top comments in its quiet parts, in place of
 	// the lyrics (quietComment), for a source with comments: the listener
 	// turns it on.
@@ -91,7 +101,14 @@ type settings struct {
 }
 
 func defaultSettings() settings {
-	return settings{Language: i18n.System, NotchActivity: true, Quality: "high", Appearance: "system", Volume: 0.8, Normalize: true, AppIcon: "dock-and-menubar", CacheMB: 2048}
+	dolby := dolbyPresets[0]
+	dolby.profile.InputTarget = -24
+	return settings{
+		Language: i18n.System, NotchActivity: true, Quality: "high", Appearance: "system", Volume: 0.8,
+		MetronomeVolume: 1, Normalize: true, AppIcon: "dock-and-menubar", CacheMB: 2048,
+		Dolby: true, DolbyEffect: dolbySelection{Preset: dolby.id, Custom: dolby.profile},
+		DemucsPositioning: true,
+	}
 }
 
 func settingsPath() (string, error) {
@@ -104,8 +121,13 @@ func settingsPath() (string, error) {
 
 // loadSettings reads the settings, or returns the defaults.
 func loadSettings() settings {
+	path, _ := settingsPath()
+	return readSettings(path)
+}
+
+func readSettings(path string) settings {
 	s := defaultSettings()
-	if path, err := settingsPath(); err == nil {
+	if path != "" {
 		if b, err := os.ReadFile(path); err == nil {
 			json.Unmarshal(b, &s)
 		}
@@ -128,7 +150,12 @@ func (s settings) save() error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(path, b, 0o600)
+	part := path + ".part"
+	defer os.Remove(part)
+	if err := os.WriteFile(part, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(part, path)
 }
 
 // applyAppearance makes the windows light, dark, or follow the system. Only

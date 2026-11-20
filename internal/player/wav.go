@@ -12,16 +12,17 @@ import (
 // numbers of 8 to 32 bits or floating point, in frames all the same size. So a
 // seek goes straight to the byte of the frame it's asked for.
 type wavStream struct {
-	dl     *download
-	format wavFormat
-	start  int64 // the first frame's byte
-	frames int64 // the length, or -1 if unknown
-	pos    int64
-	r      *downloadReader
-	buf    []byte
-	spec   *spectrum
-	drop   func() // lets the download go, as the stream closes
-	once   sync.Once
+	dl      *download
+	format  wavFormat
+	start   int64 // the first frame's byte
+	frames  int64 // the length, or -1 if unknown
+	pos     int64
+	downmix bool // multichannel PCM from the native codecs
+	r       *downloadReader
+	buf     []byte
+	spec    *spectrum
+	drop    func() // lets the download go, as the stream closes
+	once    sync.Once
 }
 
 // wavFormat is what a WAV's fmt chunk says of its frames.
@@ -134,6 +135,10 @@ func (s *wavStream) Len() int64      { return s.frames }
 // Read gives stereo: a mono file in both ears, and the front left and right of
 // one with more, which WAV puts first.
 func (s *wavStream) Read(dst []float32) (int, error) {
+	return s.read(dst, nil)
+}
+
+func (s *wavStream) read(dst, surround []float32) (int, error) {
 	frames := len(dst) / 2
 	if s.frames >= 0 {
 		frames = int(min(int64(frames), s.frames-s.pos))
@@ -154,8 +159,29 @@ func (s *wavStream) Read(dst []float32) (int, error) {
 	}
 	for i := range got {
 		frame := s.buf[i*align:]
-		dst[i*2] = s.sample(frame)
-		dst[i*2+1] = s.sample(frame[right:])
+		if s.downmix {
+			channels := s.format.channels
+			var samples [atmosPCMChannels]float32
+			for ch := range channels {
+				samples[ch] = s.sample(frame[ch*width:])
+			}
+			if surround != nil {
+				copy(surround[i*channels:], samples[:channels])
+			}
+			// Leave headroom for the center and back channels in stereo playback.
+			left := samples[0] + 0.7071*(samples[2]+samples[4])
+			right := samples[1] + 0.7071*(samples[2]+samples[5])
+			gain := float32(2.4142)
+			if channels == atmosPCMChannels {
+				left += 0.7071 * (samples[6] + samples[8])
+				right += 0.7071 * (samples[7] + samples[9])
+				gain += 1.4142
+			}
+			dst[i*2], dst[i*2+1] = left/gain, right/gain
+		} else {
+			dst[i*2] = s.sample(frame)
+			dst[i*2+1] = s.sample(frame[right:])
+		}
 	}
 	if got > 0 {
 		s.spec.feed(s.pos, dst[:got*2])

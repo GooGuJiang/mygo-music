@@ -2,6 +2,23 @@
 
 All notable changes to MyGo Music are written down here. Versions follow [Semantic Versioning](https://semver.org).
 
+## [0.1.26] - 2026-11-21
+
+### Added
+
+- On Windows x64, Dolby controls and Demucs stem mixing support spatial playback. Native decoders support Dolby audio and additional local file formats.
+- Automix preloads the next track and uses Beat This on CPU or CUDA to align downbeats and select transition points. The progress bar marks the transition and the Automix panel shows its timing and preload status.
+- Automix can fade in the next track's accompaniment first, let the outgoing vocal phrase finish, and trade drums and bass on the new phrase's first beat. It compares natural gaps with short, harmonically matched loops and keeps both tracks at their original tempo for large BPM jumps.
+- The metronome marks beats and downbeats. Hover over its button to adjust the click gain up to 400%.
+
+### Fixed
+
+- The main volume and metronome gain are saved after adjustment and restored at startup.
+
+### Changed
+
+- The Windows x64 installer includes the CPU backend. CUDA runs from a separate ZIP with the libraries required by the bundled models.
+
 ## [0.1.25] - 2026-11-14
 
 ### Added
@@ -247,6 +264,7 @@ All notable changes to MyGo Music are written down here. Versions follow [Semant
 
 The first release: a native music player that plays your local files and gets everything else from plugins.
 
+[0.1.26]: https://github.com/GooGuJiang/mygo-music/compare/298c88a...v0.1.26
 [0.1.25]: https://github.com/egoist/mygo-music/compare/v0.1.24...v0.1.25
 [0.1.24]: https://github.com/egoist/mygo-music/compare/v0.1.23...v0.1.24
 [0.1.23]: https://github.com/egoist/mygo-music/compare/v0.1.22...v0.1.23

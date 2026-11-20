@@ -1,6 +1,7 @@
 package player
 
 import (
+	"math"
 	"sync/atomic"
 	"time"
 )
@@ -18,18 +19,76 @@ type watched struct {
 	now func() time.Time
 	// ended hears that a call that took starvedAfter or longer returned,
 	// for what said it's buffering to say so no more.
-	ended func()
-	since atomic.Int64 // when the call on its way began, in Unix nanoseconds, or 0
+	ended      func()
+	firstRead  func(bool) // decoder goroutine, once the cue has PCM or has failed
+	firstFrame int64
+	since      atomic.Int64 // when the call on its way began, in Unix nanoseconds, or 0
+	rhythm     *demucsStream
+	clickGain  atomic.Uint64 // the click's float64 gain, or zero while off
+	automix    atomic.Pointer[automixEQ]
+	bands      automixBands
+	frame      int64
+}
+
+func (w *watched) setAutomix(plan *automixPlan, incoming bool) {
+	var eq *automixEQ
+	var stems *automixStemEnvelope
+	var loop *automixLoopAudio
+	if plan != nil {
+		if plan.preparedAudio(false) != nil {
+			if prepared := plan.preparedAudio(incoming); prepared != nil && prepared.rate == w.SampleRate() {
+				loop = prepared
+			}
+		} else {
+			rate := w.SampleRate()
+			eq = newAutomixEQ(plan, rate, incoming)
+			if w.rhythm != nil {
+				stems = newAutomixStemEnvelope(plan, rate, incoming)
+				eq.stemMix = plan.stems.analyzed || plan.bridge
+			}
+		}
+	}
+	if w.rhythm != nil {
+		w.rhythm.automix.Store(stems)
+		w.rhythm.automixLoop.Store(loop)
+	}
+	w.automix.Store(eq)
 }
 
 func (w *watched) Read(dst []float32) (int, error) {
 	defer w.begin()()
-	return w.stream.Read(dst)
+	n, err := w.stream.Read(dst)
+	frame := w.frame
+	if eq := w.automix.Load(); eq != nil && n > 0 {
+		w.bands.apply(dst[:n], frame, w.SampleRate(), eq)
+	}
+	if w.rhythm != nil && n > 0 {
+		if gain := math.Float64frombits(w.clickGain.Load()); gain > 0 {
+			w.rhythm.rhythm.Load().addClicks(dst[:n], frame, w.SampleRate(), gain)
+		}
+	}
+	if n > 0 {
+		w.frame += int64(n / w.Channels())
+	}
+	if first := w.firstRead; first != nil && frame >= w.firstFrame && (n > 0 || err != nil) {
+		w.firstRead = nil
+		first(n > 0)
+	}
+	return n, err
 }
 
 func (w *watched) SetPosition(frame int64) error {
 	defer w.begin()()
-	return w.stream.SetPosition(frame)
+	if err := w.stream.SetPosition(frame); err != nil {
+		if first := w.firstRead; first != nil && frame >= w.firstFrame {
+			w.firstRead = nil
+			first(false)
+		}
+		return err
+	}
+	w.frame = frame
+	w.bands = automixBands{}
+	return nil
 }
 
 func (w *watched) begin() func() {

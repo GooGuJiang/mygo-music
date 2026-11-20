@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/egoist/mygo/audio"
+	"github.com/egoist/mygo/audio/mp4"
 	gomp3 "github.com/hajimehoshi/go-mp3"
 
 	"mygo-music/internal/music"
@@ -37,8 +38,9 @@ type download struct {
 	cancel context.CancelFunc
 	// part is the file's path until the cache keeps it, which keep does
 	// once the song has all come in: the path it is at then.
-	part string
-	keep func(part string, n int64) (string, bool)
+	part    string
+	keep    func(part string, n int64) (string, bool)
+	tempDir string // owned directory for a decoded file kept by one or more readers
 	// users counts what reads or writes the song: the stream decoding it,
 	// until it closes, and the goroutine fetching it. The last to go
 	// closes the file, and removes it unless the cache kept it.
@@ -228,6 +230,9 @@ func (d *download) release() {
 	if d.part != "" {
 		os.Remove(d.part)
 	}
+	if d.tempDir != "" {
+		os.RemoveAll(d.tempDir)
+	}
 	d.file, d.data, d.n, d.part = nil, nil, 0, ""
 }
 
@@ -335,11 +340,27 @@ type stream interface {
 // ALAC or AAC in an MP4, as its first bytes say. An MP3 says nothing of its
 // length, nor does AAC still coming in: durationMs is it.
 func openStream(dl *download, durationMs int64) (stream, error) {
+	return openTrackStream(context.Background(), dl, durationMs)
+}
+
+func openTrackStream(ctx context.Context, dl *download, durationMs int64) (stream, error) {
 	dl.waitFor(12)
+	if typ := music.DolbyAudioFormat(dl.peek(0, 8)); typ != "" {
+		return openCodecPCM(ctx, dl, typ)
+	}
 	if head := dl.peek(0, 12); len(head) == 12 {
 		switch {
 		case string(head[4:8]) == "ftyp":
-			return openMP4Stream(dl)
+			s, decodeErr := openMP4Stream(dl)
+			if decodeErr == nil {
+				return s, nil
+			}
+			f := &downloadFile{dl: dl}
+			size, _ := f.Seek(0, io.SeekEnd)
+			if track, err := mp4.ReadTrack(f, size); err == nil && music.IsDolbyMP4(track.Codec) {
+				return openCodecPCM(ctx, dl, "mov")
+			}
+			return nil, decodeErr
 		case (string(head[:4]) == "RIFF" || string(head[:4]) == "RF64") && string(head[8:12]) == "WAVE":
 			return openWAVStream(dl)
 		}
@@ -355,6 +376,14 @@ func openStream(dl *download, durationMs int64) (stream, error) {
 		}
 		if _, _, ok := adtsHeader(head); ok {
 			return openADTSStream(dl, off, durationMs)
+		}
+		if off == 0 && frameSize(head) == 0 {
+			// A raw TrueHD cut can start before the next major sync frame.
+			const probe = 64 << 10
+			dl.waitFor(probe)
+			if music.ContainsTrueHDSync(dl.peek(0, probe)) {
+				return openCodecPCM(ctx, dl, "truehd")
+			}
 		}
 	}
 	return openMP3Stream(dl, durationMs)
@@ -383,6 +412,8 @@ func openShared(dl *download, durationMs int64) (stream, error) {
 		s.spec, s.drop = nil, dl.release
 	case *adtsStream:
 		s.spec, s.drop = nil, dl.release
+	case *codecPCM:
+		s.spec, s.dropInput = nil, dl.release
 	}
 	return s, nil
 }

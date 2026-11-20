@@ -97,6 +97,32 @@ func TestHomeFrameBudget(t *testing.T) {
 	}
 }
 
+// Opening the Dolby panel over a paused track must leave the playback bar idle.
+func TestDolbyPopoverFrameBudget(t *testing.T) {
+	if !dolbySupported {
+		t.Skip("Dolby playback is available on Windows x64")
+	}
+	a := newTestApp()
+	a.pl.Cue([]music.Track{song("7", "宝船", "DOUDOU")})
+	view := ui.NewTester(a.view, 880, 580)
+	settled(view)
+	label := T("Dolby Processing")
+	clickSettingRole(t, view, ui.RoleButton, label)
+	settled(view)
+	if !a.dolbyOpen {
+		t.Fatal("clicking the Dolby button did not open the panel")
+	}
+	view.Advance(2 * time.Second)
+	if view.FramePending() {
+		t.Error("the open Dolby panel asks for frames while playback is paused")
+	}
+	view.Key(0, ui.KeyEscape)
+	settled(view)
+	if a.dolbyOpen {
+		t.Fatal("Escape did not close the Dolby panel")
+	}
+}
+
 // Another song's backdrop fades in over the last one's, which is then let
 // go, so that the backdrop stops asking for frames.
 func TestBackdropFadeEnds(t *testing.T) {

@@ -26,9 +26,13 @@ import (
 	"github.com/dhowden/tag"
 	"github.com/egoist/mygo/audio/mp4"
 	"golang.org/x/text/encoding/simplifiedchinese"
+
+	"mygo-music/internal/music"
 )
 
 const (
+	localDolby = runtime.GOOS == "windows" && runtime.GOARCH == "amd64"
+
 	// indexVersion changes when what's kept of a file does, for all of them to
 	// be read again.
 	indexVersion = 2
@@ -244,6 +248,10 @@ func walk(ctx context.Context, folders []string) []found {
 			}
 			switch strings.ToLower(filepath.Ext(name)) {
 			case ".mp3", ".flac", ".ogg", ".wav", ".m4a", ".aac":
+			case ".ac3", ".eac3", ".ec3", ".thd", ".truehd", ".mp4":
+				if !localDolby {
+					return nil
+				}
 			default:
 				return nil
 			}
@@ -322,6 +330,10 @@ func (s *Source) readFile(file found) (entry, bool) {
 	defer f.Close()
 
 	typ := fileType(f, file.path)
+	videoContainer := strings.EqualFold(filepath.Ext(file.path), ".mp4")
+	if videoContainer && typ != "m4a" {
+		return entry{}, false
+	}
 	var track *mp4.Track
 	switch typ {
 	case "m4a":
@@ -329,8 +341,15 @@ func (s *Source) readFile(file found) (entry, bool) {
 		if track, ok = m4aTrack(f, file.size); !ok {
 			return entry{}, false // HE-AAC, say, which the player doesn't decode
 		}
+		if videoContainer && !music.IsDolbyMP4(track.Codec) {
+			return entry{}, false
+		}
 	case "aac":
 		if !adtsPlayable(f) {
+			return entry{}, false
+		}
+	case "ac3", "eac3", "truehd":
+		if !localDolby {
 			return entry{}, false
 		}
 	}
@@ -360,6 +379,8 @@ func (s *Source) readFile(file found) (entry, bool) {
 		e.Duration = track.Duration.Milliseconds()
 	case "aac":
 		e.Duration = adtsDuration(f, file.size)
+	case "ac3", "eac3", "truehd":
+		// Playback obtains the duration from the decoded stream.
 	default:
 		e.Duration = mp3Duration(f, file.size)
 	}
@@ -592,11 +613,13 @@ func coverExt(pic *tag.Picture) string {
 	return ""
 }
 
-// fileType says whether a file is an mp3, a flac, an ogg, a wav, an m4a or an
-// aac: by what it holds if that tells, and else by its name.
+// fileType identifies the audio from its header or, failing that, its name.
 func fileType(f io.ReaderAt, path string) string {
 	var head [12]byte
 	if _, err := f.ReadAt(head[:], 0); err == nil {
+		if typ := music.DolbyAudioFormat(head[:]); typ != "" {
+			return typ
+		}
 		if string(head[4:8]) == "ftyp" {
 			return "m4a"
 		}
@@ -620,6 +643,8 @@ func fileType(f io.ReaderAt, path string) string {
 	switch ext := strings.ToLower(filepath.Ext(path)); ext {
 	case ".flac", ".ogg", ".wav", ".m4a", ".aac":
 		return ext[1:]
+	case ".thd", ".truehd":
+		return "truehd"
 	}
 	return "mp3"
 }

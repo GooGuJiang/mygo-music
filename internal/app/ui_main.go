@@ -79,6 +79,17 @@ func (a *app) view(c *ui.Context) {
 		c.Toast(a.toast)
 		a.toast = ""
 	}
+	if a.volumesDirty {
+		a.volumesDirty = false
+		a.volumeSaveAt = c.Now().Add(volumeSaveDelay)
+	}
+	if !a.volumeSaveAt.IsZero() {
+		if left := a.volumeSaveAt.Sub(c.Now()); left > 0 {
+			c.After(left)
+		} else {
+			a.saveVolumes()
+		}
+	}
 	a.askLikes()
 	a.syncWindows()
 }

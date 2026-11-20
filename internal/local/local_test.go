@@ -243,12 +243,14 @@ func TestScanReadsTags(t *testing.T) {
 
 // A FLAC behind an ID3 tag still reads as the FLAC it is.
 func TestFLACBehindID3(t *testing.T) {
-	dir := t.TempDir()
-	write(t, filepath.Join(dir, "x.flac"), append(id3([2]string{"TIT2", "from id3"}), flacWith(t, nil, "TITLE=from flac")...))
-	s := scanned(t, dir)
-	tr := songNamed(t, s, "from flac")
-	if tr.Duration != 5000 {
-		t.Errorf("duration: %d", tr.Duration)
+	path := filepath.Join(t.TempDir(), "x.flac")
+	data := append(id3([2]string{"TIT2", "from id3"}), flacWith(t, nil, "TITLE=from flac")...)
+	write(t, path, data)
+	// Read the track without writing a scan index that can race TempDir cleanup on Windows.
+	s := New(t.TempDir())
+	track, ok := s.readFile(found{path: path, size: int64(len(data))})
+	if !ok || track.Title != "from flac" || track.Duration != 5000 {
+		t.Fatalf("FLAC behind ID3: title %q, duration %d, read %t", track.Title, track.Duration, ok)
 	}
 }
 

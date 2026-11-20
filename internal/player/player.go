@@ -930,13 +930,19 @@ func (p *Player) loadTrack(at, skipped, dir int, play bool, from, overlap time.D
 						}
 						if !ready || wait < -110*time.Millisecond {
 							p.watch.setAutomix(nil, true)
-							if outgoingWatch != nil {
-								outgoingWatch.setAutomix(nil, false)
+							if mix.loop != nil {
+								// The repeat is already in the outgoing buffers. Let its tail finish while the new track fades in.
+								overlap = max(trackHandoffFade, mix.overlap+wait)
+							} else {
+								overlap = automixOverlap
+								if outgoingWatch != nil {
+									outgoingWatch.setAutomix(nil, false)
+								}
 							}
 							if atCue {
 								p.out.Seek(0)
 							}
-							overlap, mix = automixOverlap, &automixPlan{target: automixMixPosition(outgoing), overlap: automixOverlap}
+							mix = &automixPlan{target: automixMixPosition(outgoing), overlap: overlap}
 							if p.handoff == outgoing {
 								p.automixMix = mix
 							}

@@ -33,16 +33,24 @@ type watched struct {
 func (w *watched) setAutomix(plan *automixPlan, incoming bool) {
 	var eq *automixEQ
 	var stems *automixStemEnvelope
+	var loop *automixLoopAudio
 	if plan != nil {
-		rate := w.SampleRate()
-		eq = newAutomixEQ(plan, rate, incoming)
-		if w.rhythm != nil {
-			stems = newAutomixStemEnvelope(plan, rate, incoming)
-			eq.stemMix = plan.stems.analyzed || plan.bridge
+		if plan.loop != nil {
+			if !incoming && plan.loop.rate == w.SampleRate() {
+				loop = plan.loop
+			}
+		} else {
+			rate := w.SampleRate()
+			eq = newAutomixEQ(plan, rate, incoming)
+			if w.rhythm != nil {
+				stems = newAutomixStemEnvelope(plan, rate, incoming)
+				eq.stemMix = plan.stems.analyzed || plan.bridge
+			}
 		}
 	}
 	if w.rhythm != nil {
 		w.rhythm.automix.Store(stems)
+		w.rhythm.automixLoop.Store(loop)
 	}
 	w.automix.Store(eq)
 }

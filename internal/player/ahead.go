@@ -137,11 +137,16 @@ func (p *Player) scheduleAutomix(out *audio.Player) {
 					if pair := p.nextRhythm.pair.Load(); pair != nil {
 						plan := matchBars(pair.out, pair.in, out.Duration(), position)
 						if plan.count == 0 {
-							plan = planAutomixBridge(pair.out, pair.in, out.Duration(), position)
+							if loop := pair.loop; loop != nil && p.watch != nil && p.watch.rhythm == s && loop.rate == p.watch.SampleRate() &&
+								position+automixLoopDecodeLead < loop.cut.end-loop.cut.voice {
+								plan = automixPlan{bridge: true, cue: loop.cut.cue, target: loop.cut.target(), overlap: automixLoopTail, loop: loop}
+							} else {
+								plan = planAutomixBridge(pair.out, pair.in, out.Duration(), position)
+							}
 						}
 						// Give stem analysis time to finish without missing a usable downbeat.
 						rampDue := plan.count > 0 && plan.bars[0].speed != 1 && plan.rampStart-position <= time.Second
-						if plan.timed() && (pair.stemsReady || rampDue || plan.target-position <= 5*time.Second) {
+						if plan.timed() && (plan.loop != nil || pair.stemsReady || rampDue || plan.target-position <= 5*time.Second) {
 							if !pair.stemsReady {
 								p.nextRhythm.cancel()
 							}

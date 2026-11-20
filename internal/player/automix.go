@@ -32,6 +32,7 @@ type automixPlan struct {
 	count, inBars, beats int
 	bridge               bool
 	stems                automixStemTiming
+	loop                 *automixLoopAudio
 }
 
 func (m *automixPlan) timed() bool { return m != nil && (m.count > 0 || m.bridge) }

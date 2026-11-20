@@ -116,6 +116,7 @@ type demucsStream struct {
 	positioning atomic.Bool
 	rhythm      atomic.Pointer[beatTimeline]
 	automix     atomic.Pointer[automixStemEnvelope]
+	automixLoop atomic.Pointer[automixLoopAudio]
 
 	// Only the playback decoder touches these fields.
 	current, next                             demucsBlock
@@ -164,6 +165,23 @@ func (p *Player) demucsGains() demucsGains {
 		demucsDrums:  offset(mix.Drums),
 		demucsBass:   offset(mix.Bass),
 		demucsOther:  offset(mix.Other),
+	}
+}
+
+func (s *demucsStream) Read(stereo []float32) (int, error) {
+	n, err := s.stream.Read(stereo)
+	position := s.position.Add(int64(n/2)) - int64(n/2)
+	s.applyAutomixLoop(stereo[:n], nil, nil, position)
+	return n, err
+}
+
+func (s *demucsStream) applyAutomixLoop(stereo, bed, weights []float32, position int64) {
+	if loop := s.automixLoop.Load(); loop != nil {
+		var gains demucsGains
+		if chosen := s.wantedMix.Load(); chosen != nil {
+			gains = *chosen
+		}
+		loop.apply(stereo, bed, weights, position, gains)
 	}
 }
 
@@ -273,6 +291,7 @@ func (s *demucsStream) readSurround(stereo, bed, weights []float32) (int, error)
 		}
 		first = last
 	}
+	s.applyAutomixLoop(stereo[:n], bed, weights, position)
 	if frames > 0 {
 		s.setProcessing(used)
 	}

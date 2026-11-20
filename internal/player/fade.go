@@ -49,6 +49,11 @@ func (f *fader) level(now time.Time) float64 {
 func (f *fader) apply(now time.Time) {
 	level := f.level(now)
 	gain := f.gain * level
+	if f.handoff != nil && f.mix != nil && f.mix.loop != nil {
+		// The cached audio already does the outgoing fades. Open the new track on its first beat.
+		f.out.SetVolume(f.gain)
+		return
+	}
 	if f.handoff != nil {
 		if f.mix != nil && f.mix.bridge {
 			level = f.mix.bridgeProgress(level)
@@ -145,6 +150,9 @@ func (f *fader) fade(to float64, d time.Duration, done func()) {
 		d = time.Duration(float64(d) * span)
 	}
 	f.from, f.to, f.start, f.dur = from, to, now, d
+	if f.mix != nil && f.mix.loop != nil {
+		f.apply(now)
+	}
 	f.mu.Unlock()
 	go func() {
 		tick := time.NewTicker(8 * time.Millisecond)

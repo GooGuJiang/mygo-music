@@ -157,7 +157,7 @@ type automixStemSource struct {
 	split       [][2 * demucsOther]float32
 }
 
-func (s automixStemSource) render(from, end time.Duration, c automixLoopCut, resume bool, gainsAt func(time.Duration) [demucsStemCount]float32) *automixLoopAudio {
+func (s automixStemSource) render(from, end time.Duration, c automixLoopCut, resume bool, filter automixLowpassTail, gainsAt func(time.Duration) [demucsStemCount]float32) *automixLoopAudio {
 	frameAt := func(at time.Duration) int {
 		return int(math.Round((at - s.timeline.start).Seconds() * float64(s.rate)))
 	}
@@ -184,14 +184,28 @@ func (s automixStemSource) render(from, end time.Duration, c automixLoopCut, res
 		}
 		return s.dry[2*at+ch] - x[ch] - x[2+ch] - x[4+ch]
 	}
+	var bass, backing stereoBiquad
+	if filter.at != 0 {
+		bass.lowpass(s.rate, 200)
+		backing.lowpass(s.rate, 520)
+	}
 	for i := begin; i < finish; i++ {
-		gains := gainsAt(from + time.Duration(i-begin)*time.Second/time.Duration(s.rate))
+		at := from + time.Duration(i-begin)*time.Second/time.Duration(s.rate)
+		gains := gainsAt(at)
+		var backingWet, bassExtra float32
+		if filter.at != 0 {
+			backingWet = nativeRamp(at, filter.at-140*time.Millisecond, filter.at+25*time.Millisecond)
+			if filter.bassGain > 0 {
+				hold := filter.bassGain * nativeRamp(at, filter.at-125*time.Millisecond, filter.at-35*time.Millisecond) * (1 - nativeRamp(at, filter.at, filter.bassEnd))
+				bassExtra = max(0, hold-gains[demucsBass])
+			}
+		}
 		source := i
 		if i >= seam {
 			source -= length
 		}
 		for stem, gain := range gains {
-			if gain == 0 {
+			if gain == 0 && !(stem == demucsBass && bassExtra > 0) {
 				continue
 			}
 			for ch := range 2 {
@@ -200,7 +214,17 @@ func (s automixStemSource) render(from, end time.Duration, c automixLoopCut, res
 					blend := float32(automixRampProgress(int64(i), int64(seam-edge), int64(seam)))
 					sample += blend * (read(i-length, stem, ch) - sample)
 				}
-				a.frames[i-begin][stem*2+ch] = gain * sample
+				mixed := gain * sample
+				if filter.at != 0 {
+					switch stem {
+					case demucsBass:
+						mixed += bassExtra * float32(bass.sample(ch, float64(sample)))
+					case demucsOther:
+						low := float32(backing.sample(ch, float64(sample)))
+						mixed += gain * backingWet * (low - sample)
+					}
+				}
+				a.frames[i-begin][stem*2+ch] = mixed
 			}
 		}
 	}
@@ -210,7 +234,7 @@ func (s automixStemSource) render(from, end time.Duration, c automixLoopCut, res
 func renderAutomixLoop(c automixLoopCut, t *beatTimeline, rate, first int, dry []float32, split [][2 * demucsOther]float32) *automixLoopAudio {
 	s := automixStemSource{t, rate, first, dry, split}
 	begin, pivot := c.end-c.voice, c.target()
-	return s.render(begin, pivot+automixLoopTail, c, false, func(at time.Duration) [demucsStemCount]float32 {
+	return s.render(begin, pivot+automixLoopTail, c, false, automixLowpassTail{}, func(at time.Duration) [demucsStemCount]float32 {
 		return [demucsStemCount]float32{
 			1 - nativeRamp(at, begin, c.end-automixLoopSeam),
 			1 - nativeRamp(at, pivot-75*time.Millisecond, pivot),

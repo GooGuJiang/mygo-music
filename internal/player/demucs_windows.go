@@ -32,14 +32,22 @@ func findDemucs() string {
 
 func startDemucs(ctx context.Context, worker string, mode DemucsMode, rate int) (*demucsWorker, error) {
 	runtime := filepath.Join(filepath.Dir(worker), "native-v1")
+	cuda := filepath.Join(runtime, "cuda")
+	if _, err := os.Stat(filepath.Join(cuda, "ggml-cuda.dll")); err != nil {
+		if imported, err := importedDemucsRuntime(); err == nil {
+			cuda = filepath.Join(imported, "cuda")
+		}
+	}
 	if mode == DemucsAuto {
 		mode = DemucsCUDA
-		if _, err := os.Stat(filepath.Join(runtime, string(mode), "ggml-cuda.dll")); err != nil {
+		if _, err := os.Stat(filepath.Join(cuda, "ggml-cuda.dll")); err != nil {
 			mode = DemucsCPU
 		}
 	}
 	dir := filepath.Join(runtime, string(mode))
-	if mode == DemucsCPU && !windows.IsProcessorFeaturePresent(windows.PF_AVX2_INSTRUCTIONS_AVAILABLE) {
+	if mode == DemucsCUDA {
+		dir = cuda
+	} else if !windows.IsProcessorFeaturePresent(windows.PF_AVX2_INSTRUCTIONS_AVAILABLE) {
 		dir = filepath.Join(runtime, "cpu-portable")
 	}
 	if _, err := os.Stat(filepath.Join(dir, "audiocpp.dll")); err != nil {
@@ -91,7 +99,7 @@ func startDemucs(ctx context.Context, worker string, mode DemucsMode, rate int) 
 		return nil, fmt.Errorf("worker failed to initialize (%s): %w", mode, err)
 	}
 	line = strings.TrimSpace(line)
-	rhythm := mode == DemucsCUDA && line == "READY mix-v3 cuda"
+	rhythm := line == "READY mix-v3 "+string(mode)
 	if !rhythm && line != "READY mix-v2 "+string(mode) {
 		closeWorker()
 		return nil, fmt.Errorf("incompatible Demucs worker response: %q", strings.TrimSpace(line))

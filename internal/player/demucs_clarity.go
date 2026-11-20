@@ -2,13 +2,8 @@ package player
 
 import "math"
 
-type clarityBand struct {
-	b0, b1, b2, a1, a2 float64
-	z1, z2             [2]float64
-}
-
 type demucsClarity struct {
-	bands         [4]clarityBand
+	bands         [4]stereoBiquad
 	step, release float64
 	mix, gain     float64
 }
@@ -22,18 +17,7 @@ func newDemucsClarity(rate int) *demucsClarity {
 	frequencies := [...]float64{3750, 5813, 9000, 11250}
 	gains := [...]float64{1, 2, 2, 1}
 	for i, hz := range frequencies {
-		// Peaking filter from the Audio EQ Cookbook, with Q = 1.5.
-		sine, cosine := math.Sincos(2 * math.Pi * hz / float64(rate))
-		alpha := sine / 3
-		a := math.Pow(10, gains[i]/40)
-		a0 := 1 + alpha/a
-		eq.bands[i] = clarityBand{
-			b0: (1 + alpha*a) / a0,
-			b1: -2 * cosine / a0,
-			b2: (1 - alpha*a) / a0,
-			a1: -2 * cosine / a0,
-			a2: (1 - alpha/a) / a0,
-		}
+		eq.bands[i].peak(rate, hz, 1.5, gains[i])
 	}
 	return eq
 }
@@ -72,10 +56,7 @@ func (eq *demucsClarity) process(samples, weights []float32, enabled bool) {
 		for b := range eq.bands {
 			f := &eq.bands[b]
 			for ch, x := range y {
-				out := f.b0*x + f.z1[ch]
-				f.z1[ch] = f.b1*x - f.a1*out + f.z2[ch]
-				f.z2[ch] = f.b2*x - f.a2*out
-				y[ch] = out
+				y[ch] = f.sample(ch, x)
 			}
 		}
 		// Limit the filtered branch with one gain for both channels to preserve the stereo image.

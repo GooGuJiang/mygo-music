@@ -270,9 +270,19 @@ func (a *app) dolbySettings(c *ui.Context, row settingsRow) {
 			a.changed()
 		}
 	})
-	row(T("Automix"), T("Crossfade into the next ready track when Demucs uses CUDA. Applies from the next track."), func() {
-		mode := s.demucsMode()
-		if ui.Switch(c.Key("automix"), &s.Automix).Label(T("Automix")).Disabled(mode != player.DemucsAuto && mode != player.DemucsCUDA).Changed() {
+	cudaHelp := T("Import the Windows x64 CUDA ZIP, then select Auto or CUDA. Applies from the next track.")
+	if a.cudaImportMessage != "" {
+		cudaHelp = a.cudaImportMessage
+	}
+	row(T("CUDA Package"), cudaHelp, func() {
+		label := T("Import CUDA Package")
+		if a.cudaImporting {
+			label = T("Importing CUDA package…")
+		}
+		ui.Button(c.Key("import-cuda"), label).Disabled(a.cudaImporting).OnClick(a.startCUDAImport)
+	})
+	row(T("Automix"), T("Crossfade queued tracks. Demucs adds beat and key matching in stereo."), func() {
+		if ui.Switch(c.Key("automix"), &s.Automix).Label(T("Automix")).Changed() {
 			a.changed()
 		}
 	})

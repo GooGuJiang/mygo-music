@@ -11,6 +11,7 @@ import (
 )
 
 const beatSpan = 10 * time.Second
+const automixWindow = 24 * time.Second // maximum beat request accepted by the worker
 
 // MetronomeMaxVolume is four times the nominal click level.
 const MetronomeMaxVolume = 4
@@ -25,6 +26,9 @@ type beatEvent struct {
 type beatTimeline struct {
 	start, end time.Duration
 	events     []beatEvent
+	tones      []tonalFrame
+	energy     []automixEnergy
+	stems      []automixStem
 }
 
 func (w *demucsWorker) detectBeats(rate int, stereo []float32) ([]int32, error) {
@@ -52,35 +56,36 @@ func (w *demucsWorker) detectBeats(rate int, stereo []float32) ([]int32, error) 
 	return events, binary.Read(w.output, binary.LittleEndian, events)
 }
 
-func detectBeats(ctx context.Context, engine *demucsEngine, s stream, start time.Duration) (*beatTimeline, error) {
+func detectBeats(ctx context.Context, engine *demucsEngine, s stream, start, span time.Duration) (*beatTimeline, []float32, error) {
 	rate := s.SampleRate()
 	if s.Channels() != 2 || rate < 32000 || rate > 192000 || !engine.rhythm.Load() {
-		return nil, errBeatUnavailable
+		return nil, nil, errBeatUnavailable
 	}
 	frame := start.Nanoseconds() * int64(rate) / int64(time.Second)
 	if err := s.SetPosition(frame); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	pcm := make([]float32, 2*rate*18)
+	pcm := make([]float32, 2*rate*int(span/time.Second))
 	count := 0
 	for count < len(pcm) && ctx.Err() == nil {
 		n, err := s.Read(pcm[count:])
 		count += n
 		if err != nil && err != io.EOF {
-			return nil, err
+			return nil, nil, err
 		}
 		if n == 0 || err == io.EOF {
 			break
 		}
 	}
-	if count < 2*rate {
-		return &beatTimeline{start: start, end: start + time.Duration(count/2)*time.Second/time.Duration(rate)}, nil
+	pcm = pcm[:count-count%2]
+	timeline := &beatTimeline{start: start, end: start + time.Duration(len(pcm)/2)*time.Second/time.Duration(rate)}
+	if len(pcm) < 2*rate {
+		return timeline, nil, ctx.Err()
 	}
-	result := engine.request(demucsJob{ctx: ctx, rate: rate, stereo: pcm[:count], beats: true})
+	result := engine.request(demucsJob{ctx: ctx, rate: rate, stereo: pcm, beats: true})
 	if result.err != nil {
-		return nil, result.err
+		return nil, nil, result.err
 	}
-	timeline := &beatTimeline{start: start, end: start + time.Duration(count/2)*time.Second/time.Duration(rate)}
 	for _, x := range result.beats {
 		bar := x < 0
 		if bar {
@@ -91,7 +96,7 @@ func detectBeats(ctx context.Context, engine *demucsEngine, s stream, start time
 			timeline.events = append(timeline.events, beatEvent{at, bar})
 		}
 	}
-	return timeline, nil
+	return timeline, pcm, nil
 }
 
 func (s *demucsStream) analyzeRhythm(ctx context.Context, duration int64) {
@@ -119,35 +124,48 @@ func (s *demucsStream) analyzeRhythm(ctx context.Context, duration int64) {
 	defer decoder.Close()
 	rate := time.Duration(s.SampleRate())
 	last := time.Duration(-1)
+	lastTail := false
 	for {
 		at := time.Duration(s.position.Load()) * time.Second / rate
 		start := max(0, (at+2*time.Second).Truncate(beatSpan)-4*time.Second)
+		old := s.rhythm.Load()
+		tail := false
 		if frames := decoder.Len(); frames > 0 {
 			end := time.Duration(frames) * time.Second / rate
-			if end-at <= 16*time.Second {
-				start = max(0, end-18*time.Second)
+			tailStart := max(0, end-automixWindow)
+			if end-at <= automixWindow+4*time.Second && (at >= tailStart || old != nil && old.start <= at && old.end > tailStart+3*time.Second) {
+				start, tail = tailStart, true
 			}
 		}
-		if start != last && (decoder.Len() < 0 || start < time.Duration(decoder.Len())*time.Second/rate) {
-			window, err := detectBeats(ctx, engine, decoder, start)
+		if (start != last || tail != lastTail) &&
+			(decoder.Len() < 0 || start < time.Duration(decoder.Len())*time.Second/rate) {
+			span := 18 * time.Second
+			if tail {
+				span = automixWindow
+			}
+			window, _, err := detectBeats(ctx, engine, decoder, start, span)
 			if err != nil {
 				return
 			}
-			if old := s.rhythm.Load(); old != nil && start > last && start-last <= beatSpan {
+			if old != nil && start > last && start+3*time.Second < old.end {
 				cut := start + 3*time.Second
+				keep := start - 4*time.Second
+				if tail {
+					keep = start - automixWindow // keep preceding downbeats for the tempo ramp
+				}
 				events := slices.DeleteFunc(slices.Clone(old.events), func(event beatEvent) bool {
-					return event.at < start-4*time.Second || event.at >= cut
+					return event.at < keep || event.at >= cut
 				})
 				for _, event := range window.events {
 					if event.at >= cut && (len(events) == 0 || event.at-events[len(events)-1].at >= 180*time.Millisecond) {
 						events = append(events, event)
 					}
 				}
-				window.start, window.events = start-4*time.Second, events
+				window.start, window.events = max(old.start, keep), events
 			}
 			s.rhythm.Store(window)
 			engine.changed()
-			last = start
+			last, lastTail = start, tail
 		}
 		select {
 		case <-ctx.Done():

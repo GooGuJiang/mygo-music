@@ -117,6 +117,8 @@ type app struct {
 	settingsPage      string // the settings' page that shows
 	dolbySaveAt       time.Time
 	dolbyAdvanced     bool
+	cudaImporting     bool
+	cudaImportMessage string
 	settingsQuery     string // what's searched for in the settings
 	settingsSearchBox ui.Handle
 	settingsUnderTop  bool // the settings' page has scrolled under its top edge
@@ -361,9 +363,9 @@ func Run() error {
 		a.pl.Failed = a.sourceFailed
 		a.pl.Quality = func() string { return a.settings.Quality }
 		a.pl.Normalize = func() bool { return a.settings.Normalize }
+		a.pl.Automix = func() bool { return a.settings.Automix }
 		if dolbySupported {
 			a.pl.Dolby = a.settings.dolbyProfile
-			a.pl.Automix = func() bool { return a.settings.Dolby && a.settings.Automix }
 			a.pl.Demucs = a.settings.demucsMode
 			a.pl.DemucsClarity = func() bool { return a.settings.DemucsClarity }
 			a.pl.DemucsMix = func() player.DemucsMix { return a.settings.DemucsMix }

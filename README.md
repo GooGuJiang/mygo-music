@@ -40,7 +40,7 @@ The script prepares the pinned [FFmpeg libraries](https://github.com/FFmpeg-Buil
 
 For supported TrueHD Atmos and Dolby Digital Plus Atmos (E-AC-3 JOC) tracks, Harletty decodes the object audio and its position metadata. Omniphony positions the objects in a virtual 7.1.2 speaker layout. The AAF APO renders that layout to stereo headphones when **Headphone Spatial Audio** is active. Tracks outside this object decoder's supported profiles can still play through the channel decoder.
 
-The Windows x64 installer includes the four-stem HTDemucs model and CPU backend. Extract `mygo-music-windows-amd64-cuda.zip` into the directory containing `MyGo Music.exe` to add CUDA, then restart the app. CUDA mode requires a compatible NVIDIA driver. [audio.cpp release](https://github.com/0xShug0/audio.cpp/releases/tag/v0.9.5)
+The Windows x64 installer includes the four-stem HTDemucs model, Beat This and their CPU runtimes. For GPU acceleration, select **Import CUDA Package** in **Settings → Playback** and open `mygo-music-windows-amd64-cuda.zip`. With **Auto** or **CUDA** selected, the package takes effect from the next track. CUDA mode requires a compatible NVIDIA driver. [audio.cpp release](https://github.com/0xShug0/audio.cpp/releases/tag/v0.9.5)
 
 To build the installer and CUDA add-on, use PowerShell with MSVC x64 Build Tools installed. The preparation step fetches and verifies the model and libraries, or accepts local assets via `-ArchiveDirectory` and `-ModelFile`.
 
@@ -54,7 +54,7 @@ For a single portable bundle, set `$env:MYGO_MUSIC_BUNDLE_CUDA = '1'`, build wit
 
 Select **Auto**, **CUDA**, or **CPU** in **Settings → Playback → AI Spatial Audio**. MyGo prewarms the selected model and reuses it across tracks. Auto prefers CUDA and can fall back to CPU. Stem gains mix directly into stereo PCM for AAF. The headphone spatial profile uses the worker's 7.1.2 bed. Playback crossfades to the original stereo when a block is late.
 
-Enable **Automix** to crossfade into the next ready queue track when Demucs runs on CUDA with a stereo preset. Following [pyCrossfade](https://github.com/oguzhan-yilmaz/pyCrossfade), MyGo gradually adjusts the outgoing tempo, matches up to two bars using detected downbeats, and blends with an equal-power fade and three-band EQ. Hover over the Automix button to see its status and transition timing. When there is no compatible beat grid, MyGo uses a standard crossfade of up to 2.5 seconds. When the next track is still loading, the current song plays to its end.
+Enable **Automix** to crossfade into the next ready queue track. With Beat This through Demucs on CPU or CUDA, stereo playback ranks cue points and overlap lengths by phrase boundaries, beat accents, local key compatibility, and overlap between the separated vocal stems. MyGo checks 1:1, half-time, and double-time beat grids, then uses [pyCrossfade](https://github.com/oguzhan-yilmaz/pyCrossfade) style downbeat stretches and three-band EQ for the chosen overlap. A confident key clash limits the overlap to two bars. If the beat grid is unreliable, MyGo uses a standard crossfade of up to 2.5 seconds. When the next track is still loading, the current song plays to its end. Hover over Automix to see the timing and how many beats will overlap.
 
 ## Podcast captions
 

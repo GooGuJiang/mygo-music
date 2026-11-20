@@ -597,7 +597,6 @@ func (a *app) playerHoverPanel(c *ui.Context, button ui.Element, key, label stri
 
 func (a *app) automixDetails(c *ui.Context) {
 	info := a.pl.AutomixInfo()
-	mode := a.settings.demucsMode()
 	status := T("Waiting for the next ready track")
 	switch {
 	case info.Active && info.Bars > 0:
@@ -610,8 +609,8 @@ func (a *app) automixDetails(c *ui.Context) {
 		status = T("Preparing beat match")
 	case info.Queued:
 		status = T("Preparing standard crossfade")
-	case mode == player.DemucsOff || mode == player.DemucsCPU || a.settings.dolbyProfile().Spatial:
-		status = T("Requires CUDA and a stereo preset")
+	case a.settings.dolbyProfile().Spatial:
+		status = T("Automix needs stereo playback")
 	case info.PreloadFailed:
 		status = T("Could not preload the next track")
 	case info.Preloading && info.Progress > 0:
@@ -637,7 +636,7 @@ func (a *app) automixDetails(c *ui.Context) {
 		}
 		if info.Bars > 0 {
 			ui.Textf(c, "%.1f → %.1f BPM", info.FromBPM, info.ToBPM).FontFeatures("tnum").FontSize(11).TextColor(p.muted)
-			ui.Text(c, Tf("Crossfade %.1f s · Bars %d", info.Overlap.Seconds(), info.Bars)).FontSize(11).TextColor(p.muted)
+			ui.Text(c, Tf("Crossfade %.1f s · %d beats", info.Overlap.Seconds(), info.Beats)).FontSize(11).TextColor(p.muted)
 			ui.Text(c, Tf("Next track cue %s", clock(info.Cue))).FontSize(11).TextColor(p.muted)
 		} else if info.Queued {
 			ui.Text(c, Tf("Crossfade %.1f s", info.Overlap.Seconds())).FontSize(11).TextColor(p.muted)

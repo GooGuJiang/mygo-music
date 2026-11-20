@@ -9,6 +9,19 @@ import (
 	"testing"
 )
 
+// Optional stem analysis cannot jump ahead of an already waiting playback block.
+func TestDemucsPrioritizesWaitingPlayback(t *testing.T) {
+	engine := demucsEngine{jobs: make(chan demucsJob, 1), analysisJobs: make(chan demucsJob, 1)}
+	engine.analysisJobs <- demucsJob{analysis: true}
+	engine.jobs <- demucsJob{}
+	if job, ok := engine.nextJob(t.Context()); !ok || job.analysis {
+		t.Fatal("took analysis ahead of playback")
+	}
+	if job, ok := engine.nextJob(t.Context()); !ok || !job.analysis {
+		t.Fatal("analysis did not resume after playback")
+	}
+}
+
 // Preparing starts one worker before audio arrives, and auto keeps its CPU fallback for later tracks.
 func TestDemucsEngineReusesFallbackAcrossRates(t *testing.T) {
 	const frames = 3

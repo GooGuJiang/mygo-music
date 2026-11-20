@@ -8,10 +8,38 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 
 	"mygo-music/internal/player"
 )
+
+// Importing a package from playback settings forwards the selected ZIP without changing the CPU preference.
+func TestCUDAImportFromPlaybackSettings(t *testing.T) {
+	a := newTestApp()
+	a.settingsPage = "playback"
+	a.settings.DemucsMode = player.DemucsCPU
+	ch := posts(a)
+	realChoose, realImport := chooseCUDAZip, importCUDAZip
+	t.Cleanup(func() { chooseCUDAZip, importCUDAZip = realChoose, realImport })
+	chooseCUDAZip = func(*mygo.Window) ([]string, error) { return []string{"cuda.zip"}, nil }
+	var selected string
+	importCUDAZip = func(path string) error { selected = path; return nil }
+	view := ui.NewTester(a.settingsView, 780, 1120)
+	settled(view)
+	clickSettingRole(t, view, ui.RoleButton, T("Import CUDA Package"))
+	if !a.cudaImporting {
+		t.Fatal("click did not start CUDA import")
+	}
+	runPost(t, ch)
+	if selected != "cuda.zip" || a.cudaImporting || a.cudaImportMessage == "" || a.settings.DemucsMode != player.DemucsCPU {
+		t.Fatalf("import selected %q, still importing %v, mode %q", selected, a.cudaImporting, a.settings.DemucsMode)
+	}
+	if dir := os.Getenv("MM_FRAMES"); dir != "" {
+		view.Frame()
+		saveFrame(t, dir, "cuda-import-settings.png", view.Image())
+	}
+}
 
 // The Automix info stays open as the pointer moves into it and keeps the button's click behavior.
 func TestPlayerBarAutomixHover(t *testing.T) {
@@ -282,14 +310,14 @@ func TestDemucsDeviceSelection(t *testing.T) {
 	for _, choice := range []struct {
 		label string
 		mode  player.DemucsMode
-	}{{"CUDA", player.DemucsCUDA}, {"CPU", player.DemucsCPU}, {"Auto", player.DemucsAuto}, {"Off", player.DemucsOff}} {
+	}{{"CPU", player.DemucsCPU}, {"CUDA", player.DemucsCUDA}, {"Auto", player.DemucsAuto}, {"Off", player.DemucsOff}} {
 		clickSettingRole(t, view, ui.RolePopUpButton, T("AI Spatial Audio"))
 		settled(view)
 		if err := view.Click(T(choice.label)); err != nil {
 			t.Fatal(err)
 		}
 		view.Frame()
-		if choice.mode == player.DemucsCUDA {
+		if choice.mode == player.DemucsCPU {
 			clickSettingRole(t, view, ui.RoleSwitch, T("Automix"))
 			view.Frame()
 		}

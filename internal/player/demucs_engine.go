@@ -9,11 +9,12 @@ import (
 )
 
 type demucsJob struct {
-	ctx    context.Context
-	rate   int
-	stereo []float32
-	beats  bool
-	result chan demucsRender
+	ctx      context.Context
+	rate     int
+	stereo   []float32
+	beats    bool
+	analysis bool
+	result   chan demucsRender
 }
 
 type demucsRender struct {
@@ -72,6 +73,22 @@ func (p *Player) PrepareDemucs() {
 	}, func() { p.post(func() {}) })
 }
 
+// RefreshDemucs prepares the selected GPU backend for the next track after an import.
+func (p *Player) RefreshDemucs() {
+	if p.Demucs == nil {
+		return
+	}
+	mode := p.Demucs()
+	if mode != DemucsAuto && mode != DemucsCUDA {
+		return
+	}
+	if p.demucs != nil {
+		p.demucs.release()
+		p.demucs = nil
+	}
+	p.PrepareDemucs()
+}
+
 // CloseDemucs shuts down both the prepared worker and any finishing its track.
 func (p *Player) CloseDemucs() {
 	if p.cancelDemucs != nil {
@@ -86,20 +103,21 @@ func (p *Player) CloseDemucs() {
 // One engine owns the pipe. A cancelled track can discard a render without
 // interrupting the worker or leaving a partial response for the next track.
 type demucsEngine struct {
-	mode    DemucsMode
-	cancel  context.CancelFunc
-	changed func()
-	jobs    chan demucsJob
-	done    chan struct{}
-	users   atomic.Int32
-	device  atomic.Pointer[DemucsMode]
-	failed  atomic.Bool
-	rhythm  atomic.Bool
+	mode         DemucsMode
+	cancel       context.CancelFunc
+	changed      func()
+	jobs         chan demucsJob
+	analysisJobs chan demucsJob
+	done         chan struct{}
+	users        atomic.Int32
+	device       atomic.Pointer[DemucsMode]
+	failed       atomic.Bool
+	rhythm       atomic.Bool
 }
 
 func newDemucsEngine(ctx context.Context, mode DemucsMode, start func(context.Context, DemucsMode) (*demucsWorker, error), changed func()) *demucsEngine {
 	ctx, cancel := context.WithCancel(ctx)
-	e := &demucsEngine{mode: mode, cancel: cancel, changed: changed, jobs: make(chan demucsJob), done: make(chan struct{})}
+	e := &demucsEngine{mode: mode, cancel: cancel, changed: changed, jobs: make(chan demucsJob), analysisJobs: make(chan demucsJob), done: make(chan struct{})}
 	e.users.Store(1)
 	go e.run(ctx, start)
 	return e
@@ -128,18 +146,39 @@ func (e *demucsEngine) render(ctx context.Context, rate int, stereo []float32) d
 func (e *demucsEngine) request(job demucsJob) demucsRender {
 	job.result = make(chan demucsRender, 1)
 	ctx := job.ctx
+	jobs := e.jobs
+	if job.beats || job.analysis {
+		jobs = e.analysisJobs
+	}
 	select {
 	case <-ctx.Done():
 		return demucsRender{err: ctx.Err()}
 	case <-e.done:
 		return demucsRender{err: errDemucsStopped}
-	case e.jobs <- job:
+	case jobs <- job:
 	}
 	select {
 	case <-ctx.Done():
 		return demucsRender{err: ctx.Err()}
 	case result := <-job.result:
 		return result
+	}
+}
+
+func (e *demucsEngine) nextJob(ctx context.Context) (demucsJob, bool) {
+	// A waiting playback block goes ahead of the next Automix analysis block.
+	select {
+	case job := <-e.jobs:
+		return job, true
+	default:
+		select {
+		case <-ctx.Done():
+			return demucsJob{}, false
+		case job := <-e.jobs:
+			return job, true
+		case job := <-e.analysisJobs:
+			return job, true
+		}
 	}
 }
 
@@ -155,8 +194,8 @@ func (e *demucsEngine) run(ctx context.Context, start func(context.Context, Demu
 		var err error
 		worker, err = start(ctx, mode)
 		if err == nil {
-			e.device.Store(&worker.device)
 			e.rhythm.Store(worker.rhythm)
+			e.device.Store(&worker.device)
 			e.changed()
 		}
 		return err
@@ -177,49 +216,48 @@ func (e *demucsEngine) run(ctx context.Context, start func(context.Context, Demu
 		return
 	}
 	for {
-		select {
-		case <-ctx.Done():
+		job, ok := e.nextJob(ctx)
+		if !ok {
 			return
-		case job := <-e.jobs:
-			if job.ctx.Err() != nil || ctx.Err() != nil {
-				job.result <- demucsRender{err: errDemucsStopped}
+		}
+		if job.ctx.Err() != nil || ctx.Err() != nil {
+			job.result <- demucsRender{err: errDemucsStopped}
+			continue
+		}
+		if job.beats {
+			beats, err := worker.detectBeats(job.rate, job.stereo)
+			job.result <- demucsRender{beats: beats, err: err}
+			if err == nil {
 				continue
 			}
-			if job.beats {
-				beats, err := worker.detectBeats(job.rate, job.stereo)
-				job.result <- demucsRender{beats: beats, err: err}
-				if err == nil {
-					continue
-				}
-				e.rhythm.Store(false)
-				e.changed()
-				if errors.Is(err, errBeatUnavailable) {
-					continue
-				}
-				worker.Close()
-				if err := open(worker.device); err != nil {
-					fail(err)
-					return
-				}
-				worker.rhythm = false
-				e.rhythm.Store(false)
+			e.rhythm.Store(false)
+			e.changed()
+			if errors.Is(err, errBeatUnavailable) {
 				continue
 			}
-			result := job.renderOn(worker)
-			if result.err != nil && e.mode == DemucsAuto && worker.device == DemucsCUDA && ctx.Err() == nil {
-				e.device.Store(nil)
-				e.changed()
-				worker.Close()
-				result = demucsRender{err: open(DemucsCPU)}
-				if result.err == nil && job.ctx.Err() == nil {
-					result = job.renderOn(worker)
-				}
-			}
-			job.result <- result
-			if result.err != nil {
-				fail(result.err)
+			worker.Close()
+			if err := open(worker.device); err != nil {
+				fail(err)
 				return
 			}
+			worker.rhythm = false
+			e.rhythm.Store(false)
+			continue
+		}
+		result := job.renderOn(worker)
+		if result.err != nil && e.mode == DemucsAuto && worker.device == DemucsCUDA && ctx.Err() == nil {
+			e.device.Store(nil)
+			e.changed()
+			worker.Close()
+			result = demucsRender{err: open(DemucsCPU)}
+			if result.err == nil && job.ctx.Err() == nil {
+				result = job.renderOn(worker)
+			}
+		}
+		job.result <- result
+		if result.err != nil {
+			fail(result.err)
+			return
 		}
 	}
 }

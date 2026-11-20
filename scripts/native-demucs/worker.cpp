@@ -267,7 +267,10 @@ int main(int argc, char** argv) try {
         std::printf("Demucs ready: %s (2.25 s of PCM in %.3f s)\n", device.data(), seconds);
         return 0;
     }
-    const bool beat_supported = device == "cuda" && std::filesystem::exists(runtime_dir / L"beat_this.onnx");
+    const bool gpu = device == "cuda";
+    const auto beat_dir = gpu ? runtime_dir : runtime_dir.parent_path() / L"rhythm";
+    const bool beat_supported = std::filesystem::exists(beat_dir / L"beat_this.onnx") &&
+        std::filesystem::exists(beat_dir / L"logmel.onnx") && std::filesystem::exists(beat_dir / L"onnxruntime.dll");
     std::printf("READY %s %s\n", beat_supported ? "mix-v3" : "mix-v2", device.data());
     if (std::fflush(stdout) != 0) {
         throw std::runtime_error("could not write Demucs handshake");
@@ -295,7 +298,7 @@ int main(int argc, char** argv) try {
             std::vector<int32_t> events;
             if (beat_supported && !beat_failed) {
                 try {
-                    if (!tracker) tracker = BeatTracker::open(runtime_dir);
+                    if (!tracker) tracker = BeatTracker::open(beat_dir, gpu);
                     events = tracker->detect(stereo, input_rate);
                     count = static_cast<int32_t>(events.size());
                 } catch (const std::exception& error) {

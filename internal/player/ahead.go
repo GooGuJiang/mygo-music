@@ -18,7 +18,7 @@ const (
 type nextRhythm struct {
 	source, id, quality string
 	cancel              context.CancelFunc
-	timeline            atomic.Pointer[beatTimeline]
+	pair                atomic.Pointer[automixPair]
 }
 
 func (p *Player) clearNextRhythm() {
@@ -28,7 +28,7 @@ func (p *Player) clearNextRhythm() {
 	}
 }
 
-func (p *Player) prepareNextRhythm(engine *demucsEngine, quality string) {
+func (p *Player) prepareNextRhythm(out *demucsStream, quality string, end time.Duration) {
 	t, ok := p.upNext()
 	if !ok {
 		p.clearNextRhythm()
@@ -53,6 +53,12 @@ func (p *Player) prepareNextRhythm(engine *demucsEngine, quality string) {
 	if dl == nil {
 		return
 	}
+	outDL, _ := out.source()
+	if outDL == nil || outDL.Progress() < 1 || !outDL.share() {
+		dl.release()
+		return
+	}
+	engine, duration := out.engine, p.track.Duration
 	ctx, cancel := context.WithCancel(context.Background())
 	n := &nextRhythm{source: t.Source, id: t.ID, quality: quality, cancel: cancel}
 	p.nextRhythm = n
@@ -60,14 +66,18 @@ func (p *Player) prepareNextRhythm(engine *demucsEngine, quality string) {
 	go func() {
 		defer engine.release()
 		defer dl.release()
-		s, err := openShared(dl, t.Duration)
+		defer outDL.release()
+		in, err := openShared(dl, t.Duration)
 		if err != nil {
 			return
 		}
-		defer s.Close()
-		if window, err := detectBeats(ctx, engine, s, 0); err == nil && ctx.Err() == nil {
-			n.timeline.Store(window)
+		defer in.Close()
+		old, err := openShared(outDL, duration)
+		if err != nil {
+			return
 		}
+		defer old.Close()
+		analyzeAutomixPair(ctx, engine, old, in, end, n.pair.Store)
 	}()
 }
 
@@ -77,10 +87,10 @@ func (p *Player) AutomixActive() bool {
 }
 
 func (p *Player) scheduleAutomix(out *audio.Player) {
-	s, ok := p.stream.(*demucsStream)
-	if !ok || s.engine.mode == DemucsCPU || p.Automix == nil || out.Duration() < 2*automixOverlap {
+	if p.Automix == nil || p.track != nil && p.track.ShowID != "" || out.Duration() < 2*automixOverlap {
 		return
 	}
+	s, _ := p.stream.(*demucsStream)
 	post := p.Quiet
 	if post == nil {
 		post = p.post
@@ -88,14 +98,6 @@ func (p *Player) scheduleAutomix(out *audio.Player) {
 	var check func()
 	check = func() {
 		if p.out != out {
-			return
-		}
-		if s.failed.Load() {
-			p.cancelAutomixPrep()
-			return
-		}
-		if device := s.engine.device.Load(); device != nil && *device != DemucsCUDA {
-			p.cancelAutomixPrep()
 			return
 		}
 		position := out.Position()
@@ -109,23 +111,39 @@ func (p *Player) scheduleAutomix(out *audio.Player) {
 		if p.ahead != nil && p.ahead.quality != quality {
 			p.refreshAhead()
 		}
-		stats := s.processing.Load()
-		if p.Automix() && remaining <= 35*time.Second && p.playing && out.Playing() && !p.seeking && !p.Loading() && p.handoff == nil &&
-			stats != nil && stats.device == DemucsCUDA && (p.Dolby == nil || !p.Dolby().Spatial) && p.automixReady(quality) {
-			if s.engine.rhythm.Load() {
-				p.prepareNextRhythm(s.engine, quality)
+		enabled := p.Automix() && (p.Dolby == nil || !p.Dolby().Spatial)
+		if !enabled {
+			p.clearNextRhythm()
+		}
+		lookahead := 45 * time.Second
+		if s != nil && s.engine != nil {
+			if device := s.engine.device.Load(); device != nil && *device == DemucsCPU {
+				lookahead = 2 * time.Minute
+			}
+		}
+		if enabled && remaining <= lookahead && p.playing && out.Playing() && !p.seeking && !p.Loading() && p.handoff == nil && p.automixReady(quality) {
+			if s != nil && s.engine != nil && !s.failed.Load() && s.engine.rhythm.Load() {
+				p.prepareNextRhythm(s, quality, out.Duration())
 				if prep := p.automixPrep; prep != nil && prep.next != p.nextRhythm {
 					p.cancelAutomixPrep()
 				}
-				if p.automixPrep == nil && p.nextRhythm != nil && remaining <= 16*time.Second {
-					plan := matchBars(s.rhythm.Load(), p.nextRhythm.timeline.Load(), out.Duration(), position)
-					if plan.count > 0 {
-						p.automixPrep = &automixPreparation{plan: plan, next: p.nextRhythm, out: out, watch: p.watch}
-						if p.watch != nil {
-							p.watch.setAutomixEQ(plan.target, plan.outEnd(), false)
+				if p.automixPrep == nil && p.nextRhythm != nil {
+					if pair := p.nextRhythm.pair.Load(); pair != nil {
+						plan := matchBars(pair.out, pair.in, out.Duration(), position)
+						// Give stem analysis time to finish without missing a usable downbeat.
+						if plan.count > 0 && (pair.stemsReady || plan.target-position <= 5*time.Second) {
+							if !pair.stemsReady {
+								p.nextRhythm.cancel()
+							}
+							p.automixPrep = &automixPreparation{plan: plan, next: p.nextRhythm, out: out, watch: p.watch}
+							if p.watch != nil {
+								p.watch.automix.Store(newAutomixEQ(&plan, p.watch.SampleRate(), false))
+							}
 						}
 					}
 				}
+			} else {
+				p.cancelAutomixPrep()
 			}
 			if prep := p.automixPrep; prep != nil {
 				position = automixMixPosition(out)
@@ -133,13 +151,12 @@ func (p *Player) scheduleAutomix(out *audio.Player) {
 				delta := plan.target - position
 				switch {
 				case delta > automixLead:
-					speed := plan.approach(position)
+					speed, next := plan.approach(position)
 					if out.Speed() != speed {
 						out.SetPreservesPitch(true).SetSpeed(speed)
 					}
-					wait = min(wait, max(40*time.Millisecond, plan.ramp-position), delta-automixLead)
+					wait = min(wait, time.Duration(float64(min(next-position, delta-automixLead))/speed))
 				case delta > 80*time.Millisecond:
-					out.SetPreservesPitch(true).SetSpeed(plan.bars[0].speed)
 					p.automixPrep = nil // handoff takes ownership of the running transition
 					p.loadTrack((p.at+1)%len(p.order), 0, forward, true, plan.cue, plan.overlap, plan)
 					return

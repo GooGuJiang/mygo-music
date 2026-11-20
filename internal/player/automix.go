@@ -8,18 +8,20 @@ import (
 	"mygo-music/internal/music"
 )
 
-const automixBars = 2
+const automixBars = 8 // pyCrossfade's default overlap and tempo ramp in bars
 
 type automixBar struct {
-	out, in time.Duration
-	speed   float64
-	beats   int
+	out, in           time.Duration
+	outSplit, inSplit time.Duration
+	speed, nextSpeed  float64
+	beats, inBeats    int
 }
 
 type automixPlan struct {
-	cue, target, ramp, overlap time.Duration
-	bars                       [automixBars]automixBar
-	count                      int
+	cue, target, overlap time.Duration
+	ramp                 []time.Duration
+	bars                 [automixBars]automixBar
+	count, inBars, beats int
 }
 
 type automixPreparation struct {
@@ -35,7 +37,7 @@ type AutomixInfo struct {
 	Preloading, Ready, PreloadFailed bool
 	Progress                         float64
 	Next                             string
-	Bars                             int
+	Bars, Beats                      int
 	FromBPM, ToBPM                   float64
 	Start, Cue                       time.Duration
 	Overlap                          time.Duration
@@ -65,12 +67,12 @@ func (p *Player) AutomixInfo() AutomixInfo {
 		}
 		return info
 	}
-	info.Active, info.Queued, info.Bars = p.AutomixActive(), true, plan.count
+	info.Active, info.Queued, info.Bars, info.Beats = p.AutomixActive(), true, plan.inBars, plan.beats
 	info.Start, info.Cue, info.Overlap = plan.target, plan.cue, plan.overlap
 	if plan.count > 0 {
 		bar := plan.bars[0]
 		info.FromBPM = 60 * float64(bar.beats) / bar.out.Seconds()
-		info.ToBPM = 60 * float64(bar.beats) / bar.in.Seconds()
+		info.ToBPM = 60 * float64(bar.inBeats) / bar.in.Seconds()
 	}
 	return info
 }
@@ -88,12 +90,8 @@ func (p *Player) AutomixPoint() (point time.Duration, estimated, ok bool) {
 }
 
 func (p *Player) estimatedAutomixPoint() (time.Duration, bool) {
-	s, ok := p.stream.(*demucsStream)
-	if !ok || s.engine == nil || s.engine.mode == DemucsCPU || s.failed.Load() || p.out == nil ||
+	if p.out == nil || p.stream == nil || p.track != nil && p.track.ShowID != "" ||
 		p.Automix == nil || !p.Automix() || p.Dolby != nil && p.Dolby().Spatial {
-		return 0, false
-	}
-	if device := s.engine.device.Load(); device != nil && *device != DemucsCUDA {
 		return 0, false
 	}
 	t, ok := p.upNext()
@@ -125,64 +123,6 @@ func automixMixPosition(out *audio.Player) time.Duration {
 	return position
 }
 
-// matchBars follows pyCrossfade: stretch each outgoing bar to the measured length of its incoming counterpart.
-func matchBars(out, in *beatTimeline, end, position time.Duration) automixPlan {
-	if out == nil || in == nil || out.end+100*time.Millisecond < end {
-		return automixPlan{}
-	}
-	downbeats := func(t *beatTimeline) []int {
-		var bars []int
-		for i, e := range t.events {
-			if e.bar {
-				bars = append(bars, i)
-			}
-		}
-		return bars
-	}
-	from, to := downbeats(out), downbeats(in)
-	for count := automixBars; count > 0; count-- {
-		for i := len(from) - count - 1; i >= 0; i-- {
-			target := out.events[from[i]].at
-			if target <= position+automixLead+automixAhead {
-				break
-			}
-			if tail := end - out.events[from[i+count]].at; tail < 0 || tail > 3*time.Second {
-				continue
-			}
-			for j := 0; j+count < len(to); j++ {
-				cue := in.events[to[j]].at
-				if cue > 3*time.Second {
-					break
-				}
-				ramp := max(position+automixAhead, out.events[from[max(0, i-2)]].at)
-				if target-ramp <= automixLead+300*time.Millisecond {
-					continue
-				}
-				plan := automixPlan{cue: cue, target: target, ramp: ramp}
-				for k := range count {
-					outLen := out.events[from[i+k+1]].at - out.events[from[i+k]].at
-					inLen := in.events[to[j+k+1]].at - in.events[to[j+k]].at
-					beats := from[i+k+1] - from[i+k]
-					if beats < 2 || beats != to[j+k+1]-to[j+k] || inLen < 750*time.Millisecond || inLen > 4*time.Second {
-						break
-					}
-					speed := float64(outLen) / float64(inLen)
-					if speed < .85 || speed > 1.18 {
-						break
-					}
-					plan.bars[k] = automixBar{out: outLen, in: inLen, speed: speed, beats: beats}
-					plan.overlap += inLen
-					plan.count++
-				}
-				if plan.count == count {
-					return plan
-				}
-			}
-		}
-	}
-	return automixPlan{}
-}
-
 func (m *automixPlan) outEnd() time.Duration {
 	end := m.target
 	for _, bar := range m.bars[:m.count] {
@@ -191,9 +131,18 @@ func (m *automixPlan) outEnd() time.Duration {
 	return end
 }
 
-func (m *automixPlan) approach(at time.Duration) float64 {
-	progress := min(1, max(0, float64(at-m.ramp)/float64(m.target-automixLead-m.ramp)))
-	return 1 + (m.bars[0].speed-1)*progress
+func (m *automixPlan) approach(at time.Duration) (speed float64, next time.Duration) {
+	step := 0
+	next = m.target
+	for i, downbeat := range m.ramp {
+		if at < downbeat {
+			next = downbeat
+			break
+		}
+		step = i + 1
+	}
+	progress := float64(max(0, step-1)) / float64(max(1, len(m.ramp)))
+	return 1 + (m.bars[0].speed-1)*progress, next
 }
 
 // alignment maps elapsed incoming audio to outgoing source time and the speed of that bar.
@@ -201,31 +150,59 @@ func (m *automixPlan) alignment(elapsed time.Duration) (time.Duration, float64) 
 	at := m.target
 	for _, bar := range m.bars[:m.count] {
 		if elapsed < bar.in {
-			return at + time.Duration(float64(elapsed)*bar.speed), bar.speed
+			offset, speed := bar.stretch(elapsed)
+			return at + offset, speed
 		}
 		elapsed -= bar.in
 		at += bar.out
 	}
-	return at, m.bars[m.count-1].speed
+	return at, m.bars[m.count-1].lastSpeed()
+}
+
+func (bar automixBar) stretch(elapsed time.Duration) (time.Duration, float64) {
+	if bar.inSplit > 0 && elapsed >= bar.inSplit {
+		return bar.outSplit + time.Duration(float64(elapsed-bar.inSplit)*bar.nextSpeed), bar.nextSpeed
+	}
+	return time.Duration(float64(elapsed) * bar.speed), bar.speed
+}
+
+func (bar automixBar) lastSpeed() float64 {
+	if bar.nextSpeed > 0 {
+		return bar.nextSpeed
+	}
+	return bar.speed
 }
 
 type automixEQ struct {
 	start, end int64
 	incoming   bool
+	steps      [20]int64
 }
 
 type automixBands struct {
-	envelope        *automixEQ
-	low, upper      [2]float32
-	lowStep, hiStep float32
+	envelope *automixEQ
+	step     int
+	filters  [3]stereoBiquad
 }
 
-func (w *watched) setAutomixEQ(start, end time.Duration, incoming bool) {
-	rate := float64(w.SampleRate())
-	w.automix.Store(&automixEQ{
-		start: int64(math.Round(start.Seconds() * rate)),
-		end:   int64(math.Round(end.Seconds() * rate)), incoming: incoming,
-	})
+func newAutomixEQ(plan *automixPlan, rate int, incoming bool) *automixEQ {
+	frameAt := func(at time.Duration) int64 { return int64(math.Round(at.Seconds() * float64(rate))) }
+	eq := &automixEQ{incoming: incoming}
+	for i := range eq.steps {
+		elapsed := time.Duration(i) * plan.overlap / time.Duration(len(eq.steps))
+		at := plan.cue + elapsed
+		if !incoming {
+			at, _ = plan.alignment(elapsed)
+		}
+		eq.steps[i] = frameAt(at)
+	}
+	eq.start = eq.steps[0]
+	if incoming {
+		eq.end = frameAt(plan.cue + plan.overlap)
+	} else {
+		eq.end = frameAt(plan.outEnd())
+	}
+	return eq
 }
 
 func (b *automixBands) apply(pcm []float32, frame int64, rate int, eq *automixEQ) {
@@ -233,30 +210,36 @@ func (b *automixBands) apply(pcm []float32, frame int64, rate int, eq *automixEQ
 		return
 	}
 	if b.envelope != eq {
-		*b = automixBands{envelope: eq,
-			lowStep: float32(1 - math.Exp(-2*math.Pi*120/float64(rate))),
-			hiStep:  float32(1 - math.Exp(-2*math.Pi*6500/float64(rate))),
-		}
+		*b = automixBands{envelope: eq, step: -1}
 	}
-	// The complementary bands sum to the unfiltered signal. Cross the bass
-	// controls faster than the treble and dip both mids around the crossover.
-	for i := int(2 * max(0, eq.start-frame)); i+1 < len(pcm); i += 2 {
+	// Follow pyCrossfade's stepped shelves and middle dip, preserving filter state between steps.
+	edge := int64(max(1, rate/200))
+	for i, end := int(2*max(0, eq.start-frame)), min(len(pcm), int(2*(eq.end-frame))); i+1 < end; i += 2 {
 		at := frame + int64(i/2)
-		if at >= eq.end {
-			break
+		step := b.step
+		for step+1 < len(eq.steps) && at >= eq.steps[step+1] {
+			step++
 		}
-		t := float32(at-eq.start) / float32(eq.end-eq.start)
-		cut := t
-		if eq.incoming {
-			cut = 1 - t
+		if step != b.step {
+			b.step = step
+			t := float64(step) / float64(len(eq.steps)-1)
+			cut := .1 + .9*t
+			if eq.incoming {
+				cut = .9 * (1 - t)
+			}
+			const q = math.Sqrt2 / 2
+			b.filters[0].shelf(rate, 70, q, -26*cut, false)
+			b.filters[1].shelf(rate, 13000, q, -26*cut, true)
+			b.filters[2].peak(rate, 1000, q, -6*math.Sin(math.Pi*t))
 		}
-		bass, treble := 0.9*min(1, 2*cut), 0.7*cut
-		mid := 0.3 * 4 * t * (1 - t)
+		wet := float64(min(edge, at-eq.start, eq.end-at)) / float64(edge)
 		for ch := range 2 {
-			sample := pcm[i+ch]
-			b.low[ch] += b.lowStep * (sample - b.low[ch])
-			b.upper[ch] += b.hiStep * (sample - b.upper[ch])
-			pcm[i+ch] = sample - bass*b.low[ch] - mid*(b.upper[ch]-b.low[ch]) - treble*(sample-b.upper[ch])
+			x := float64(pcm[i+ch])
+			y := x
+			for k := range b.filters {
+				y = b.filters[k].sample(ch, y)
+			}
+			pcm[i+ch] = float32(x + wet*(y-x))
 		}
 	}
 }

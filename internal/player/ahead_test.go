@@ -12,8 +12,14 @@ import (
 	"mygo-music/internal/music"
 )
 
-// CUDA Automix waits for the prefetched next track before handing off the live output.
+// Automix waits for the incoming audio and uses an ordinary fade for PCM or an unreliable beat grid.
 func TestAutomixWaitsForNextTrack(t *testing.T) {
+	t.Run("PCM", func(t *testing.T) { testAutomixHandoff(t, false) })
+	t.Run("Unreliable Demucs grid", func(t *testing.T) { testAutomixHandoff(t, true) })
+}
+
+func testAutomixHandoff(t *testing.T, demucs bool) {
+	t.Helper()
 	posts, p := posted()
 	t.Cleanup(p.stop)
 	p.Cue([]music.Track{{ID: "a", Source: "s"}, {ID: "b", Source: "s"}})
@@ -21,15 +27,26 @@ func TestAutomixWaitsForNextTrack(t *testing.T) {
 	p.Automix = func() bool { return true }
 	out := p.out
 	out.Pause()
-	out.Seek(598 * time.Second)
+	out.Seek(597700 * time.Millisecond)
 	out.Play()
-	engine := &demucsEngine{mode: DemucsAuto}
-	device := DemucsCUDA
-	engine.device.Store(&device)
-	s := &demucsStream{engine: engine, cancel: func() {}}
-	s.processing.Store(&demucsStats{device: DemucsCUDA})
-	p.stream = s
 	quality := music.Qualities[len(music.Qualities)/2]
+	if demucs {
+		engine := &demucsEngine{mode: DemucsCPU}
+		device := DemucsCPU
+		engine.device.Store(&device)
+		engine.rhythm.Store(true)
+		p.stream = &demucsStream{engine: engine, cancel: func() {}}
+		old, incoming := automixGrid(1100*time.Millisecond), automixGrid(1100*time.Millisecond)
+		offset := out.Duration() - old.end
+		for i := range old.events {
+			old.events[i].at += offset
+		}
+		old.start, old.end = offset, out.Duration()
+		incoming.events[1].at += 75 * time.Millisecond
+		n := &nextRhythm{source: "s", id: "b", quality: quality, cancel: func() {}}
+		n.pair.Store(&automixPair{out: old, in: incoming, stemsReady: true})
+		p.nextRhythm = n
+	}
 	a := &ahead{source: "s", id: "b", quality: quality, done: make(chan struct{})}
 	p.ahead = a
 	var timer func()
@@ -48,6 +65,9 @@ func TestAutomixWaitsForNextTrack(t *testing.T) {
 	next(t, posts)
 	if p.Current().ID != "b" || p.handoff != out || !out.Playing() {
 		t.Fatal("Automix did not keep the outgoing track during the next track's startup")
+	}
+	if info := p.AutomixInfo(); !info.Queued || info.Beats != 0 || info.Cue != 0 {
+		t.Fatalf("expected a standard fade from the incoming track's beginning: %+v", info)
 	}
 	settle(t, posts, p)
 }

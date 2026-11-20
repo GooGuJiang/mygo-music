@@ -86,9 +86,9 @@ try {
     Stage-Backend 'cuda' $cuda
     tar.exe -xf $cudart -C (Join-Path $staged 'cuda') cudart64_13.dll cublas64_13.dll cublasLt64_13.dll cufft64_12.dll
     if ($LASTEXITCODE) { throw 'Could not extract the CUDA runtime DLLs.' }
-    & (Join-Path $PSScriptRoot 'stage-beat.ps1') -Destination (Join-Path $staged 'cuda') -Work $work -ArchiveDirectory $BeatArchiveDirectory
+    & (Join-Path $PSScriptRoot 'stage-beat.ps1') -Destination (Join-Path $staged 'cuda') -CpuDestination (Join-Path $staged 'rhythm') -Work $work -ArchiveDirectory $BeatArchiveDirectory
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'THIRD-PARTY.txt') -Destination $staged
-    $ortSDK = if ($BeatArchiveDirectory) { Join-Path $BeatArchiveDirectory 'ort-sdk.nupkg' } else { '' }
+    $ortSDK = if ($BeatArchiveDirectory) { Join-Path $BeatArchiveDirectory 'ort-sdk.nupkg' } else { Join-Path $work 'ort-sdk.nupkg' }
     & (Join-Path $PSScriptRoot 'build.ps1') -Archive $portable -OrtSDK $ortSDK
 
     if (Test-Path -LiteralPath $runtime) {

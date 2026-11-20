@@ -21,31 +21,35 @@ class BeatTracker {
     }
 
 public:
-    static std::unique_ptr<BeatTracker> open(const std::filesystem::path& dir) {
+    static std::unique_ptr<BeatTracker> open(const std::filesystem::path& dir, bool gpu) {
         const auto library = LoadLibraryExW((dir / L"onnxruntime.dll").c_str(), nullptr,
-            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_USER_DIRS);
         if (!library) throw std::runtime_error("could not load ONNX Runtime");
         using GetApiBase = const OrtApiBase* (ORT_API_CALL*)();
         const auto get_api = reinterpret_cast<GetApiBase>(GetProcAddress(library, "OrtGetApiBase"));
         const auto api = get_api ? get_api()->GetApi(ORT_API_VERSION) : nullptr;
         if (!api) throw std::runtime_error("incompatible ONNX Runtime");
         Ort::InitApi(api);
-        return std::make_unique<BeatTracker>(dir);
+        return std::make_unique<BeatTracker>(dir, gpu);
     }
 
-    explicit BeatTracker(const std::filesystem::path& dir) {
+    BeatTracker(const std::filesystem::path& dir, bool gpu) {
         Ort::SessionOptions options;
         options.SetIntraOpNumThreads(2);
-        options.AddConfigEntry("session.record_ep_graph_assignment_info", "1");
-        OrtCUDAProviderOptions cuda;
-        cuda.cudnn_conv_algo_search = OrtCudnnConvAlgoSearchHeuristic;
-        options.AppendExecutionProvider_CUDA(cuda);
+        if (gpu) {
+            options.AddConfigEntry("session.record_ep_graph_assignment_info", "1");
+            OrtCUDAProviderOptions cuda;
+            cuda.cudnn_conv_algo_search = OrtCudnnConvAlgoSearchHeuristic;
+            options.AppendExecutionProvider_CUDA(cuda);
+        }
         frontend = Ort::Session(env, (dir / L"logmel.onnx").c_str(), options);
         model = Ort::Session(env, (dir / L"beat_this.onnx").c_str(), options);
-        const auto graphs = model.GetEpGraphAssignmentInfo();
-        if (std::none_of(graphs.begin(), graphs.end(), [](const auto& graph) {
-            return graph.GetEpName() == "CUDAExecutionProvider" && !graph.GetNodes().empty();
-        })) throw std::runtime_error("Beat This model was not assigned to CUDA");
+        if (gpu) {
+            const auto graphs = model.GetEpGraphAssignmentInfo();
+            if (std::none_of(graphs.begin(), graphs.end(), [](const auto& graph) {
+                return graph.GetEpName() == "CUDAExecutionProvider" && !graph.GetNodes().empty();
+            })) throw std::runtime_error("Beat This model was not assigned to CUDA");
+        }
     }
 
     std::vector<int32_t> detect(const std::vector<float>& stereo, int rate) {

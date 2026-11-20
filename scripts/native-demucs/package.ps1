@@ -11,6 +11,18 @@ if ($CudaOnly) {
     $source = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '../../resources/windows-amd64')).Path
     $files = @('demucs/native-v1/cuda')
     $name = 'mygo-music-windows-amd64-cuda.zip'
+    $manifest = Get-Content -LiteralPath (Join-Path $PSScriptRoot '../../internal/player/cuda-runtime-v1.txt')
+    $cuda = Join-Path $source $files[0]
+    if (@(Get-ChildItem -LiteralPath $cuda -Force).Count -ne $manifest.Count) {
+        throw 'The CUDA runtime file list does not match the importer.'
+    }
+    foreach ($line in $manifest) {
+        $hash, $size, $file = $line -split ' ', 3
+        $asset = Get-Item -LiteralPath (Join-Path $cuda $file)
+        if ($asset.Length -ne [long]$size -or (Get-FileHash -LiteralPath $asset.FullName -Algorithm SHA256).Hash -ne $hash) {
+            throw "CUDA runtime file failed verification: $file"
+        }
+    }
 } else {
     $required += @('demucs/mygo-demucs.exe', 'demucs/native-v1/htdemucs-f16.gguf', 'demucs/native-v1/cpu/audiocpp.dll', 'demucs/native-v1/cpu-portable/audiocpp.dll')
     $files = @(Get-Content -LiteralPath (Join-Path $bundle '.mygo-files')) + '.mygo-files'

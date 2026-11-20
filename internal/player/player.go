@@ -43,7 +43,7 @@ type Player struct {
 	Normalize func() bool
 	// Dolby returns the current settings for the AAF Dolby Audio processor.
 	Dolby func() DolbyProfile
-	// Automix enables automatic PCM transitions when Demucs is running on CUDA.
+	// Automix enables automatic crossfades between queued tracks.
 	Automix func() bool
 	// Demucs selects the AI spatial upmix device for ordinary tracks.
 	Demucs func() DemucsMode
@@ -794,7 +794,7 @@ func (p *Player) loadTrack(at, skipped, dir int, play bool, from, overlap time.D
 	}
 	var outgoing *audio.Player
 	var outgoingWatch *watched
-	if _, demucs := p.stream.(*demucsStream); demucs && play && (from == 0 || mix != nil) && p.playing && !p.seeking &&
+	if _, demucs := p.stream.(*demucsStream); (mix != nil || demucs && from == 0) && play && p.playing && !p.seeking &&
 		p.out != nil && p.out.Playing() && src != nil && src.Info().Playback != music.PlaybackRemote {
 		outgoing, p.out = p.out, nil
 		outgoingWatch = p.watch
@@ -909,7 +909,7 @@ func (p *Player) loadTrack(at, skipped, dir int, play bool, from, overlap time.D
 			waitForFirstRead := outgoing != nil && p.handoff == outgoing
 			if waitForFirstRead {
 				if mix != nil && mix.count > 0 && s.Channels() == 2 && p.pending == mix.cue {
-					p.watch.setAutomixEQ(mix.cue, mix.cue+mix.overlap, true)
+					p.watch.automix.Store(newAutomixEQ(mix, s.SampleRate(), true))
 				}
 				if p.pending > 0 {
 					p.watch.firstFrame = int64(math.Round(p.pending.Seconds() * float64(s.SampleRate())))

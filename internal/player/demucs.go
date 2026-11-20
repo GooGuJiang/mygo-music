@@ -130,10 +130,8 @@ func newDemucsStream(base stream, engine *demucsEngine, duration int64) *demucsS
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &demucsStream{stream: base, engine: engine, cancel: cancel, wake: make(chan struct{}, 1), results: make(chan demucsBlock, 2)}
 	s.request.Store(&demucsRequest{})
-	if engine.mode != DemucsCPU {
-		engine.retain()
-		go s.analyzeRhythm(ctx, duration)
-	}
+	engine.retain()
+	go s.analyzeRhythm(ctx, duration)
 	go s.produce(ctx, duration)
 	return s
 }

@@ -3,6 +3,7 @@
 package player
 
 import (
+	"context"
 	"io"
 	"math"
 	"os"
@@ -11,12 +12,75 @@ import (
 	"time"
 )
 
-// Beat This detects stable timing on actual music and shares the live CUDA worker with separation.
-func TestNativeBeatThis(t *testing.T) {
-	if os.Getenv("MM_DEMUCS_NATIVE") != "cuda" {
-		t.Skip("set MM_DEMUCS_NATIVE=cuda after preparing the Beat This runtime")
+// The native worker provides usable beat grids, vocal activity, and drum accents to the same Automix plan.
+func TestNativeAutomixPair(t *testing.T) {
+	mode := DemucsMode(os.Getenv("MM_DEMUCS_NATIVE"))
+	if mode != DemucsCPU && mode != DemucsCUDA {
+		t.Skip("set MM_DEMUCS_NATIVE to cpu or cuda after preparing the Beat This runtime")
 	}
-	w, err := startDemucs(t.Context(), findDemucs(), DemucsCUDA, codecRate)
+	changed := make(chan struct{}, 1)
+	engine := newDemucsEngine(t.Context(), mode, func(ctx context.Context, mode DemucsMode) (*demucsWorker, error) {
+		return startDemucs(ctx, findDemucs(), mode, codecRate)
+	}, func() {
+		select {
+		case changed <- struct{}{}:
+		default:
+		}
+	})
+	t.Cleanup(engine.release)
+	select {
+	case <-changed:
+	case <-t.Context().Done():
+		t.Fatal("native engine did not start")
+	}
+	if !engine.rhythm.Load() {
+		t.Fatal("native engine has no Beat This support")
+	}
+	dl, err := openFile("../../website/public/haruhikage.m4a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(dl.Close)
+	out, err := openShared(dl, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+	in, err := openShared(dl, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer in.Close()
+	var pair, partial *automixPair
+	analyzeAutomixPair(t.Context(), engine, out, in, automixWindow, func(result *automixPair) {
+		pair = result
+		if partial == nil && len(result.out.stems) > 0 {
+			partial = result
+		}
+	})
+	if pair == nil || !pair.stemsReady || len(pair.out.stems) == 0 || len(pair.in.stems) == 0 {
+		t.Fatal("native analysis did not publish both separated excerpts")
+	}
+	if !slices.ContainsFunc(pair.out.stems, func(frame automixStem) bool { return frame.vocal > .5 }) ||
+		!slices.ContainsFunc(pair.in.stems, func(frame automixStem) bool { return frame.drums > .01 }) {
+		t.Fatal("the music fixture did not produce distinct vocals and drums")
+	}
+	if partial == nil || partial.stemsReady || partial.out.stems[0].known || !partial.out.stems[len(partial.out.stems)-1].known ||
+		!partial.in.stems[0].known || partial.in.stems[len(partial.in.stems)-1].known {
+		t.Fatal("partial analysis did not publish the outgoing tail and incoming head first")
+	}
+	if plan := matchBars(pair.out, pair.in, automixWindow, 0); plan.count == 0 || plan.beats == 0 {
+		t.Fatal("the native beat grids did not yield a playable overlap")
+	}
+}
+
+// Beat This detects stable timing on actual music and shares its worker with separation on either device.
+func TestNativeBeatThis(t *testing.T) {
+	mode := DemucsMode(os.Getenv("MM_DEMUCS_NATIVE"))
+	if mode != DemucsCUDA && mode != DemucsCPU {
+		t.Skip("set MM_DEMUCS_NATIVE to cpu or cuda after preparing the Beat This runtime")
+	}
+	w, err := startDemucs(t.Context(), findDemucs(), mode, codecRate)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,7 +96,7 @@ func TestNativeBeatThis(t *testing.T) {
 	}
 	defer s.Close()
 	rate := s.SampleRate()
-	pcm := make([]float32, 18*rate*2)
+	pcm := make([]float32, int(automixWindow/time.Second)*rate*2)
 	for filled := 0; filled < len(pcm); {
 		n, err := s.Read(pcm[filled:])
 		if n == 0 || err != nil && err != io.EOF {
@@ -42,7 +106,7 @@ func TestNativeBeatThis(t *testing.T) {
 	}
 	start := time.Now()
 	events, err := w.detectBeats(rate, pcm)
-	t.Logf("first CUDA beat window: %s", time.Since(start))
+	t.Logf("first %s beat window: %s", mode, time.Since(start))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +117,7 @@ func TestNativeBeatThis(t *testing.T) {
 	if again, err := w.detectBeats(rate, pcm); err != nil || !slices.Equal(again, events) {
 		t.Fatalf("repeat after session reuse: %v, %v", again, err)
 	}
-	t.Logf("warm CUDA beat window: %s for 18 s of music", time.Since(start))
+	t.Logf("warm %s beat window: %s for %s of music", mode, time.Since(start), automixWindow)
 	if bed, err := w.render(rate, pcm[:4*rate]); err != nil || len(bed) != 2*rate*demucsFrameSamples {
 		t.Fatalf("separation after rhythm analysis: %d samples, %v", len(bed), err)
 	}

@@ -130,8 +130,22 @@ jobs:
           security default-keychain -d user -s "$keychain"
           xcrun notarytool store-credentials notary --keychain "$keychain" \
             --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD"
+      - name: Prepare the Windows x64 Demucs resources
+        if: matrix.name == 'Windows'
+        shell: pwsh
+        run: ./scripts/native-demucs/prepare.ps1
       - name: Build and upload
         env:
           GH_TOKEN: ${{ github.token }}
+          MYGO_MUSIC_RELEASE_REPOSITORY: ${{ github.repository }}
           MYGO_UPDATER_PRIVATE_KEY: ${{ secrets.MYGO_UPDATER_PRIVATE_KEY }}
         run: go tool mygo build -platform "${{ matrix.platform }}" -upload
+      - name: Upload the optional Windows x64 CUDA runtime
+        if: matrix.name == 'Windows'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.draft-release.outputs.tag }}
+        run: |
+          $zip = ./scripts/native-demucs/package.ps1 -CudaOnly
+          gh release upload $env:TAG $zip --repo $env:GITHUB_REPOSITORY --clobber

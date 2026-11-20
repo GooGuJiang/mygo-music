@@ -51,6 +51,9 @@ func (a *app) openSettings() {
 	})
 	a.settingsWin.OnClosed(func() {
 		a.settingsWin = nil
+		if !a.dolbySaveAt.IsZero() {
+			a.saveDolby()
+		}
 		// Its sign-in dialog goes with it; a sign-in on its way still counts.
 		if a.signIn.here {
 			a.signIn.open = false
@@ -223,6 +226,13 @@ func (a *app) settingsView(c *ui.Context) {
 	})
 	a.installDialog(c, p)
 	a.signInDialog(c, p, true)
+	if !a.dolbySaveAt.IsZero() {
+		if left := a.dolbySaveAt.Sub(c.Now()); left > 0 {
+			c.After(left)
+		} else {
+			a.saveDolby()
+		}
+	}
 }
 
 // settingsSidebarWidth is the width of the list of the settings' pages.
@@ -441,6 +451,9 @@ func (a *app) settingsSections(c *ui.Context, p palette) []settingsSection {
 				a.changed()
 			}
 		})
+		if dolbySupported {
+			a.dolbySettings(c, row)
+		}
 	})
 
 	add("cache", T("Cache"), iconDatabase, func(row settingsRow, block settingsBlock) {

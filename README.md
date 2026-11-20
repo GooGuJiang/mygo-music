@@ -22,6 +22,40 @@ go tool mygo build   # package into build/
 go test ./internal/...
 ```
 
+## Dolby playback on Windows x64
+
+Open **Settings → Playback → Dolby Audio** to select a preset or adjust a custom effect. Changes are saved automatically. The sliders wait for a short pause before saving, and playback crossfades between effects. **Headphone Spatial Audio** uses `DolbyAPOv251.dll` from the app's `native-codecs` directory and outputs stereo PCM through the default Windows audio device.
+
+The **Custom** preset offers the package's Balanced, Detailed, and Warm intelligent EQ curves. **Advanced Dolby Controls** exposes the input loudness target, output gain, content-adaptive EQ, volume modeler and calibration, and surround decoder bypass. These controls apply to the player's APO instance.
+
+Turn on **Dolby Add-ons** to apply bass enhancement, the 20-band equalizer, and dialogue ducking to any preset. Turning it off keeps your adjustments for next time. The Dolby icon in the playback bar shows the current signal path and applied effects.
+
+Run the following once from PowerShell with the MSVC x64 Build Tools installed, then restart MyGo Music:
+
+```powershell
+.\scripts\native-codec\install.ps1 -AafApo 'C:\path\to\DolbyAPOv251.dll'
+```
+
+The script prepares the pinned [FFmpeg libraries](https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/tag/autobuild-2026-11-20-12-40), [Harletty object decoder](https://github.com/harletty/harletty-bridge/releases/tag/v0.9.0), [Omniphony renderer](https://github.com/mgth/Omniphony/releases/tag/v0.7.0), MyGo's bridge, and the AAF APO in `resources/windows-amd64/native-codecs/`. `go tool mygo build -platform windows/amd64` ships this folder as `native-codecs/` next to the executable. The player calls the DLLs in-process. It supports raw AC-3, E-AC-3 and TrueHD plus their audio tracks in MP4/M4A.
+
+For supported TrueHD Atmos and Dolby Digital Plus Atmos (E-AC-3 JOC) tracks, Harletty decodes the object audio and its position metadata. Omniphony positions the objects in a virtual 7.1.2 speaker layout. The AAF APO renders that layout to stereo headphones when **Headphone Spatial Audio** is active. Tracks outside this object decoder's supported profiles can still play through the channel decoder.
+
+The Windows x64 installer includes the four-stem HTDemucs model and CPU backend. Extract `mygo-music-windows-amd64-cuda.zip` into the directory containing `MyGo Music.exe` to add CUDA, then restart the app. CUDA mode requires a compatible NVIDIA driver. [audio.cpp release](https://github.com/0xShug0/audio.cpp/releases/tag/v0.9.5)
+
+To build the installer and CUDA add-on, use PowerShell with MSVC x64 Build Tools installed. The preparation step fetches and verifies the model and libraries, or accepts local assets via `-ArchiveDirectory` and `-ModelFile`.
+
+```powershell
+.\scripts\native-demucs\prepare.ps1
+go tool mygo build -platform windows/amd64
+.\scripts\native-demucs\package.ps1 -CudaOnly
+```
+
+For a single portable bundle, set `$env:MYGO_MUSIC_BUNDLE_CUDA = '1'`, build with `-skip-installer`, then run `package.ps1` without `-CudaOnly`.
+
+Select **Auto**, **CUDA**, or **CPU** in **Settings → Playback → AI Spatial Audio**. MyGo prewarms the selected model and reuses it across tracks. Auto prefers CUDA and can fall back to CPU. Stem gains mix directly into stereo PCM for AAF. The headphone spatial profile uses the worker's 7.1.2 bed. Playback crossfades to the original stereo when a block is late.
+
+Enable **Automix** to crossfade into the next ready queue track when Demucs runs on CUDA with a stereo preset. Following [pyCrossfade](https://github.com/oguzhan-yilmaz/pyCrossfade), MyGo gradually adjusts the outgoing tempo, matches up to two bars using detected downbeats, and blends with an equal-power fade and three-band EQ. Hover over the Automix button to see its status and transition timing. When there is no compatible beat grid, MyGo uses a standard crossfade of up to 2.5 seconds. When the next track is still loading, the current song plays to its end.
+
 ## Podcast captions
 
 Episodes are written down on the device as they play, with [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) and Qwen3-ASR, which the app downloads when the listener asks for them. The libraries come from this repository's `sherpa-onnx-<version>` prerelease, which only changes with that version:

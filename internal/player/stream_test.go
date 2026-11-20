@@ -1,6 +1,7 @@
 package player
 
 import (
+	"context"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -317,7 +318,7 @@ func TestFileStreamSeeks(t *testing.T) {
 	cache := NewCache(t.TempDir(), 1<<30)
 	p := &Player{Cache: cache}
 	src := fileSource{path: path}
-	info, s, err := p.open(src, music.Track{ID: "1", Source: "disk", Duration: int64(len(ref)/2) * 1000 / 44100}, "high", nil)
+	info, s, err := p.open(context.Background(), src, music.Track{ID: "1", Source: "disk", Duration: int64(len(ref)/2) * 1000 / 44100}, "high", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -8,6 +8,7 @@ import (
 	"runtime/debug"
 	"slices"
 	"sync/atomic"
+	"time"
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
@@ -114,6 +115,8 @@ type app struct {
 	searchBox ui.Handle
 
 	settingsPage      string // the settings' page that shows
+	dolbySaveAt       time.Time
+	dolbyAdvanced     bool
 	settingsQuery     string // what's searched for in the settings
 	settingsSearchBox ui.Handle
 	settingsUnderTop  bool // the settings' page has scrolled under its top edge
@@ -141,9 +144,14 @@ type app struct {
 	radioStarting string // the radio asked for its first songs, or ""
 	stationAt     int    // which of a few stations their switch has chosen
 
-	volume     float64
-	volumeOpen bool // the volume popover of the player bar shows
-	mutedFrom  float64
+	volume              float64
+	volumeOpen          bool // the volume popover of the player bar shows
+	metronomeVolumeOpen bool
+	automixInfoOpen     bool
+	volumesDirty        bool
+	volumeSaveAt        time.Time
+	dolbyOpen           bool
+	mutedFrom           float64
 
 	rowBars barState
 	// underTop and underBottom say whether the page has content under its
@@ -353,13 +361,20 @@ func Run() error {
 		a.pl.Failed = a.sourceFailed
 		a.pl.Quality = func() string { return a.settings.Quality }
 		a.pl.Normalize = func() bool { return a.settings.Normalize }
+		if dolbySupported {
+			a.pl.Dolby = a.settings.dolbyProfile
+			a.pl.Automix = func() bool { return a.settings.Dolby && a.settings.Automix }
+			a.pl.Demucs = a.settings.demucsMode
+			a.pl.DemucsClarity = func() bool { return a.settings.DemucsClarity }
+			a.pl.DemucsMix = func() player.DemucsMix { return a.settings.DemucsMix }
+			a.pl.DemucsPositioning = func() bool { return a.settings.DemucsPositioning }
+		}
 		a.pl.Cache = newSongCache(a.settings.CacheMB)
 		a.pl.Changed = func() {
 			a.keepSession()
 			a.syncCaptions()
 		}
-		a.volume = a.settings.Volume
-		a.pl.SetVolume(a.volume)
+		a.applySavedVolumes()
 		a.win = mygo.NewWindow(mygo.WindowOptions{
 			Title:         mygo.App.Name(),
 			Width:         1180,
@@ -377,6 +392,7 @@ func Run() error {
 			BackgroundColor:      "light-dark(#ffffff, #141416)",
 			Content:              ui.View(a.view),
 		})
+		a.pl.PrepareDemucs()
 		a.setMenu()
 		a.boot()
 		// The notch player is macOS's, over its menu bar: elsewhere it would
@@ -392,7 +408,12 @@ func Run() error {
 		// Hidden, it draws nothing for a while: what the heap took for
 		// the pages it showed goes back to the system, which Go would
 		// keep for minutes.
-		a.win.OnHide(func() { go debug.FreeOSMemory() })
+		a.win.OnHide(func() {
+			if a.volumesDirty || !a.volumeSaveAt.IsZero() {
+				a.saveVolumes()
+			}
+			go debug.FreeOSMemory()
+		})
 		// Shown or switched to a while after, it shows what's new.
 		a.win.OnFocus(a.freshenHome)
 		a.applyTray()
@@ -420,13 +441,15 @@ func Run() error {
 	})
 	mygo.App.OnBeforeQuit(func(*mygo.QuitEvent) {
 		a.quitting = true
-		a.settings.Volume = a.volume
-		a.settings.save()
+		a.saveVolumes()
 		a.saveSession()
 	})
 	// Windows leaves an icon in the notification area after its app until
 	// the pointer passes over it.
 	mygo.App.OnWillQuit(func(*mygo.QuitEvent) {
+		if a.pl != nil {
+			a.pl.CloseDemucs()
+		}
 		if a.tray != nil {
 			a.tray.Destroy()
 		}

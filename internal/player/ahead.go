@@ -1,6 +1,179 @@
 package player
 
-import "mygo-music/internal/music"
+import (
+	"context"
+	"sync/atomic"
+	"time"
+
+	"github.com/egoist/mygo/audio"
+	"mygo-music/internal/music"
+)
+
+const (
+	automixOverlap = 2500 * time.Millisecond
+	automixLead    = 850 * time.Millisecond
+	automixAhead   = 250 * time.Millisecond // audio.LatencyPlayback
+)
+
+type nextRhythm struct {
+	source, id, quality string
+	cancel              context.CancelFunc
+	timeline            atomic.Pointer[beatTimeline]
+}
+
+func (p *Player) clearNextRhythm() {
+	if p.nextRhythm != nil {
+		p.nextRhythm.cancel()
+		p.nextRhythm = nil
+	}
+}
+
+func (p *Player) prepareNextRhythm(engine *demucsEngine, quality string) {
+	t, ok := p.upNext()
+	if !ok {
+		p.clearNextRhythm()
+		return
+	}
+	if n := p.nextRhythm; n != nil && n.source == t.Source && n.id == t.ID && n.quality == quality {
+		return
+	}
+	p.clearNextRhythm()
+	var dl *download
+	if a := p.ahead; a != nil && a.is(t, quality) && a.err == nil {
+		if dl = a.dl; dl != nil {
+			if !dl.share() {
+				return
+			}
+		} else if path, ok := music.PathOf(a.info.URL); ok {
+			dl, _ = openFile(path)
+		}
+	} else {
+		dl, _, _ = p.Cache.lookup(t.Source, t.ID, quality)
+	}
+	if dl == nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	n := &nextRhythm{source: t.Source, id: t.ID, quality: quality, cancel: cancel}
+	p.nextRhythm = n
+	engine.retain()
+	go func() {
+		defer engine.release()
+		defer dl.release()
+		s, err := openShared(dl, t.Duration)
+		if err != nil {
+			return
+		}
+		defer s.Close()
+		if window, err := detectBeats(ctx, engine, s, 0); err == nil && ctx.Err() == nil {
+			n.timeline.Store(window)
+		}
+	}()
+}
+
+// AutomixActive reports actual overlap, including neither waiting nor manual skips.
+func (p *Player) AutomixActive() bool {
+	return p.automixMix != nil && p.handoff != nil && p.out != nil && p.out.Playing()
+}
+
+func (p *Player) scheduleAutomix(out *audio.Player) {
+	s, ok := p.stream.(*demucsStream)
+	if !ok || s.engine.mode == DemucsCPU || p.Automix == nil || out.Duration() < 2*automixOverlap {
+		return
+	}
+	post := p.Quiet
+	if post == nil {
+		post = p.post
+	}
+	var check func()
+	check = func() {
+		if p.out != out {
+			return
+		}
+		if s.failed.Load() {
+			p.cancelAutomixPrep()
+			return
+		}
+		if device := s.engine.device.Load(); device != nil && *device != DemucsCUDA {
+			p.cancelAutomixPrep()
+			return
+		}
+		position := out.Position()
+		remaining := out.Duration() - position
+		if remaining <= 0 {
+			p.cancelAutomixPrep()
+			return
+		}
+		wait := min(time.Second, max(150*time.Millisecond, remaining-5*time.Second))
+		quality := p.playbackQuality()
+		if p.ahead != nil && p.ahead.quality != quality {
+			p.refreshAhead()
+		}
+		stats := s.processing.Load()
+		if p.Automix() && remaining <= 35*time.Second && p.playing && out.Playing() && !p.seeking && !p.Loading() && p.handoff == nil &&
+			stats != nil && stats.device == DemucsCUDA && (p.Dolby == nil || !p.Dolby().Spatial) && p.automixReady(quality) {
+			if s.engine.rhythm.Load() {
+				p.prepareNextRhythm(s.engine, quality)
+				if prep := p.automixPrep; prep != nil && prep.next != p.nextRhythm {
+					p.cancelAutomixPrep()
+				}
+				if p.automixPrep == nil && p.nextRhythm != nil && remaining <= 16*time.Second {
+					plan := matchBars(s.rhythm.Load(), p.nextRhythm.timeline.Load(), out.Duration(), position)
+					if plan.count > 0 {
+						p.automixPrep = &automixPreparation{plan: plan, next: p.nextRhythm, out: out, watch: p.watch}
+						if p.watch != nil {
+							p.watch.setAutomixEQ(plan.target, plan.outEnd(), false)
+						}
+					}
+				}
+			}
+			if prep := p.automixPrep; prep != nil {
+				position = automixMixPosition(out)
+				plan := &prep.plan
+				delta := plan.target - position
+				switch {
+				case delta > automixLead:
+					speed := plan.approach(position)
+					if out.Speed() != speed {
+						out.SetPreservesPitch(true).SetSpeed(speed)
+					}
+					wait = min(wait, max(40*time.Millisecond, plan.ramp-position), delta-automixLead)
+				case delta > 80*time.Millisecond:
+					out.SetPreservesPitch(true).SetSpeed(plan.bars[0].speed)
+					p.automixPrep = nil // handoff takes ownership of the running transition
+					p.loadTrack((p.at+1)%len(p.order), 0, forward, true, plan.cue, plan.overlap, plan)
+					return
+				default:
+					p.cancelAutomixPrep()
+				}
+			}
+			if p.automixPrep == nil && remaining <= automixOverlap {
+				p.loadTrack((p.at+1)%len(p.order), 0, forward, true, 0, remaining, &automixPlan{target: position})
+				return
+			}
+		} else {
+			p.cancelAutomixPrep()
+		}
+		p.after(wait, func() { post(check) })
+	}
+	check()
+}
+
+func (p *Player) automixReady(quality string) bool {
+	t, ok := p.upNext()
+	if !ok || t.ShowID != "" {
+		return false
+	}
+	src := p.sourceOf(&t)
+	if src == nil || src.Info().Playback == music.PlaybackRemote {
+		return false
+	}
+	if a := p.ahead; a != nil && a.is(t, quality) {
+		ready, _, _ := a.transfer()
+		return ready
+	}
+	return p.Cache.has(t.Source, t.ID, quality)
+}
 
 // The next track's audio is asked for once the current one plays, and comes in
 // meanwhile, so that it starts at once when its turn comes: a source may take
@@ -17,6 +190,37 @@ type ahead struct {
 
 func (a *ahead) is(t music.Track, quality string) bool {
 	return a.source == t.Source && a.id == t.ID && a.quality == quality
+}
+
+func (a *ahead) transfer() (ready, failed bool, progress float64) {
+	select {
+	case <-a.done:
+	default:
+		return false, false, 0
+	}
+	if a.err != nil {
+		return false, true, 0
+	}
+	if a.dl == nil {
+		return true, false, 1 // file URL
+	}
+	d := a.dl
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.size > 0 {
+		progress = min(1, float64(d.n)/float64(d.size))
+	}
+	return d.done && d.err == nil, d.done && d.err != nil, progress
+}
+
+func (p *Player) refreshAhead() {
+	if p.out != nil {
+		if t, ok := p.upNext(); p.nextRhythm != nil && (!ok || p.nextRhythm.source != t.Source || p.nextRhythm.id != t.ID) {
+			p.cancelAutomixPrep()
+			p.clearNextRhythm()
+		}
+		p.getAhead(p.playbackQuality())
+	}
 }
 
 // upNext is the track that plays when the current one ends, if one does by
@@ -53,13 +257,17 @@ func (p *Player) getAhead(quality string) {
 		return
 	}
 	src := p.sourceOf(&t)
-	if src == nil || src.Info().Playback == music.PlaybackRemote || p.Cache.has(t.Source, t.ID, quality) {
+	if src == nil || src.Info().Playback == music.PlaybackRemote {
 		return
 	}
 	a := &ahead{source: t.Source, id: t.ID, quality: quality, done: make(chan struct{})}
 	p.ahead = a
 	go func() {
 		defer close(a.done)
+		if dl, info, ok := p.Cache.lookup(t.Source, t.ID, quality); ok {
+			a.dl, a.info = dl, info
+			return
+		}
 		info, err := src.Stream(t.ID, quality)
 		if err == nil && info == nil {
 			err = music.ErrUnavailable

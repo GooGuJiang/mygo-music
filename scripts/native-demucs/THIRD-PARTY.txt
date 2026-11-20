@@ -1,0 +1,21 @@
+The native Demucs worker uses audio.cpp and ggml.
+https://github.com/0xShug0/audio.cpp/releases/tag/v0.9.5
+See LICENSE.audio.cpp in each backend directory.
+
+The four-stem HTDemucs 955717e8 model comes from Demucs.
+https://github.com/adefossez/demucs
+The GGUF was published by audio.cpp. MyGo adjusts its inference segment metadata.
+https://huggingface.co/audio-cpp/audio.cpp-gguf/tree/33120a4cfdf0d56786db934a03a093d4675de938/HTDemucs-GGUF
+
+The CUDA Runtime, cuBLAS, and cuFFT libraries are NVIDIA components.
+https://docs.nvidia.com/cuda/archive/13.3.0/eula/index.html
+
+Beat This! by Francesco Foscarin, Jan Schlüter and Gerhard Widmer, final0 model
+exported to ONNX by TunePerfect. See LICENSE.beat-this.
+https://github.com/CPJKU/beat_this
+https://huggingface.co/tuneperfect/beat-this-onnx
+
+ONNX Runtime and NVIDIA cuDNN run the rhythm model on the Demucs CUDA device.
+See LICENSE.onnxruntime, THIRD-PARTY.onnxruntime.txt and LICENSE.cudnn.
+https://onnxruntime.ai/
+https://developer.nvidia.com/cudnn

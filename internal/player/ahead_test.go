@@ -1,6 +1,7 @@
 package player
 
 import (
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,6 +11,79 @@ import (
 
 	"mygo-music/internal/music"
 )
+
+// CUDA Automix waits for the prefetched next track before handing off the live output.
+func TestAutomixWaitsForNextTrack(t *testing.T) {
+	posts, p := posted()
+	t.Cleanup(p.stop)
+	p.Cue([]music.Track{{ID: "a", Source: "s"}, {ID: "b", Source: "s"}})
+	p.Source = func(string) music.Source { return &served{} }
+	p.Automix = func() bool { return true }
+	out := p.out
+	out.Pause()
+	out.Seek(598 * time.Second)
+	out.Play()
+	engine := &demucsEngine{mode: DemucsAuto}
+	device := DemucsCUDA
+	engine.device.Store(&device)
+	s := &demucsStream{engine: engine, cancel: func() {}}
+	s.processing.Store(&demucsStats{device: DemucsCUDA})
+	p.stream = s
+	quality := music.Qualities[len(music.Qualities)/2]
+	a := &ahead{source: "s", id: "b", quality: quality, done: make(chan struct{})}
+	p.ahead = a
+	var timer func()
+	p.after = func(_ time.Duration, fn func()) { timer = fn }
+	p.scheduleAutomix(out)
+	if p.Current().ID != "a" || !out.Playing() || timer == nil {
+		t.Fatal("Automix interrupted playback while the next track was unavailable")
+	}
+	data, err := os.ReadFile("testdata/seek.mp3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.info, a.dl = &music.Stream{Type: "mp3"}, downloaded(data)
+	close(a.done)
+	timer()
+	next(t, posts)
+	if p.Current().ID != "b" || p.handoff != out || !out.Playing() {
+		t.Fatal("Automix did not keep the outgoing track during the next track's startup")
+	}
+	settle(t, posts, p)
+}
+
+// Adding a next track during playback starts prefetch and exposes readiness before the handoff.
+func TestAutomixPreloadsNewNextTrack(t *testing.T) {
+	p, ch, _, q := servedQueue(t, "a", "b")
+	q[1].Name = "Vagabond"
+	p.PlayQueue(q[:1], 0)
+	settle(t, ch, p)
+	p.appendTracks(q[1:])
+	if p.ahead == nil || p.ahead.id != "b" {
+		t.Fatal("no prefetch was started for the appended track")
+	}
+	t.Cleanup(p.dropAhead)
+	eventually(t, "the appended track did not become ready", func() bool { return p.AutomixInfo().Ready })
+	if info := p.AutomixInfo(); info.Next != "Vagabond" || info.Preloading || info.PreloadFailed {
+		t.Fatalf("unexpected prefetch status: %+v", info)
+	}
+}
+
+// Overlap keeps the track endpoints, level through the midpoint, and peak headroom.
+func TestHandoffGains(t *testing.T) {
+	if out, in := handoffGains(0, .6, .5); out != .6 || in != 0 {
+		t.Fatalf("start gains = %g, %g", out, in)
+	}
+	if out, in := handoffGains(1, .6, .5); out != 0 || in != .5 {
+		t.Fatalf("end gains = %g, %g", out, in)
+	}
+	if out, in := handoffGains(.5, .6, .6); math.Abs(out*out+in*in-.36) > 1e-12 {
+		t.Fatalf("midpoint lost power: %g, %g", out, in)
+	}
+	if out, in := handoffGains(.5, 1, 1); out+in != 1 {
+		t.Fatalf("full-scale overlap can clip: %g, %g", out, in)
+	}
+}
 
 // served answers each track as a song of its own address on a server, as a
 // plugin does, counting what its source and the server are asked.

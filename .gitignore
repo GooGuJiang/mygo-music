@@ -3,3 +3,8 @@
 mygo_windows_*.syso
 /mygo-music
 /node_modules/
+/resources/windows-amd64/native-codecs/
+/resources/windows-amd64/demucs/.runtime/
+/resources/windows-amd64/demucs/__pycache__/
+/resources/windows-amd64/demucs/mygo-demucs.exe
+/resources/windows-amd64/demucs/native-v1/

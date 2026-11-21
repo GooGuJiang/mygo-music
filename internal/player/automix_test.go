@@ -10,7 +10,7 @@ import (
 	"mygo-music/internal/music"
 )
 
-// The progress marker follows the planned downbeat, then the incoming cue once playback switches tracks.
+// The marker appears once the next track is ready, then follows the planned downbeat and incoming cue.
 func TestAutomixProgressMarkerUsesTrackTime(t *testing.T) {
 	p := New(func(func()) {})
 	p.Cue([]music.Track{{ID: "a"}, {ID: "b"}})
@@ -19,6 +19,18 @@ func TestAutomixProgressMarkerUsesTrackTime(t *testing.T) {
 	p.Attach(audio.NewPlayer(silence{}))
 	t.Cleanup(p.out.Close)
 	p.stream = &demucsStream{engine: &demucsEngine{mode: DemucsCUDA}}
+	failed := make(chan struct{})
+	close(failed)
+	p.ahead = &ahead{id: "b", quality: p.playbackQuality(), done: failed, err: music.ErrUnavailable}
+	if _, _, ok := p.AutomixPoint(); ok || p.AutomixInfo().Estimated {
+		t.Fatal("showed an estimate for a failed preload")
+	}
+	loading := make(chan struct{})
+	p.ahead = &ahead{id: "b", quality: p.playbackQuality(), done: loading}
+	if _, _, ok := p.AutomixPoint(); ok || p.AutomixInfo().Estimated {
+		t.Fatal("showed an estimate while the next track was still loading")
+	}
+	close(loading)
 	if point, estimated, ok := p.AutomixPoint(); !ok || !estimated || point != p.out.Duration()-automixOverlap {
 		t.Fatalf("missing estimated point: %s, estimated=%v, ok=%v", point, estimated, ok)
 	}

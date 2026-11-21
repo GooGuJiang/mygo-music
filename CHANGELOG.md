@@ -2,6 +2,16 @@
 
 All notable changes to MyGo Music are written down here. Versions follow [Semantic Versioning](https://semver.org).
 
+## [0.1.29] - 2026-11-21
+
+### Fixed
+
+- Audio that stalls on a weak connection reconnects once and reuses the bytes already buffered when the server can confirm they belong to the same stream. If the transfer still fails, the player shows a connection error.
+- AutoMix lets the current song finish downloading before fetching the next one. Selecting Next starts the queued download immediately, and a failed preload gets a fresh audio URL when its track comes up.
+- Covers recover from temporary connection failures. Large covers with backdrops have a separate loading slot so a slow batch of thumbnails cannot use every slot.
+
+[0.1.29]: https://github.com/GooGuJiang/mygo-music/compare/v0.1.28...v0.1.29
+
 ## [0.1.28] - 2026-11-21
 
 ### Fixed

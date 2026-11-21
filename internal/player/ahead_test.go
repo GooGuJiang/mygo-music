@@ -5,12 +5,90 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"mygo-music/internal/music"
 )
+
+// Preloading yields the connection to the current track, but choosing Next fetches immediately.
+func TestAheadYieldsToPlayback(t *testing.T) {
+	b, err := os.ReadFile("testdata/seek.mp3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	requested := make(chan struct{}, 8)
+	canceled := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/a" {
+			w.Header().Set("Content-Length", strconv.Itoa(len(b)))
+			w.Write(b[:len(b)/4])
+			w.(http.Flusher).Flush()
+			<-r.Context().Done()
+			close(canceled)
+			return
+		}
+		requested <- struct{}{}
+		w.Write(b)
+	}))
+	t.Cleanup(srv.Close)
+	posts, p := posted()
+	t.Cleanup(p.stop)
+	src := &served{url: srv.URL, asked: map[string]int{}}
+	p.Source = func(string) music.Source { return src }
+	p.PlayQueue([]music.Track{{ID: "a", Source: "s", Duration: 5000}, {ID: "b", Source: "s", Duration: 5000}}, 0)
+	settle(t, posts, p)
+	if p.ahead == nil {
+		t.Fatal("next track was not queued for preload")
+	}
+	select {
+	case <-requested:
+		t.Fatal("preload competed with the active transfer")
+	case <-time.After(50 * time.Millisecond):
+	}
+	p.Next()
+	settle(t, posts, p)
+	if p.Current().ID != "b" || p.Err() != "" || !p.Playing() {
+		t.Fatalf("next did not promote the waiting preload: %v, %q", p.Current(), p.Err())
+	}
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("the retired player's download was still stalled")
+	}
+}
+
+// A preloaded CDN URL that has expired is replaced when the track comes up.
+func TestFailedAheadGetsFreshStream(t *testing.T) {
+	posts, p := posted()
+	t.Cleanup(p.stop)
+	p.Cue([]music.Track{{ID: "a", Source: "s"}, {ID: "b", Source: "s"}})
+	b, err := os.ReadFile("testdata/seek.mp3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requests.Add(1) == 1 {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		w.Write(b)
+	}))
+	defer srv.Close()
+	src := &served{url: srv.URL, asked: map[string]int{}}
+	p.Source = func(string) music.Source { return src }
+	p.getAhead(p.playbackQuality())
+	eventually(t, "preload did not report the CDN failure", func() bool { return p.AutomixInfo().PreloadFailed })
+	p.Next()
+	settle(t, posts, p)
+	if p.Current().ID != "b" || p.Err() != "" || src.count(src.asked, "b") != 2 || requests.Load() != 2 {
+		t.Fatalf("failed preload was not replaced: %v, %q, requests=%d", p.Current(), p.Err(), requests.Load())
+	}
+}
 
 // Automix waits for the incoming audio and uses an ordinary fade for PCM or an unreliable beat grid.
 func TestAutomixWaitsForNextTrack(t *testing.T) {

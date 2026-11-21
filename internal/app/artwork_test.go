@@ -234,3 +234,46 @@ func TestCoverFetchedTheSizeItShows(t *testing.T) {
 		t.Errorf("fetched %q, want %q", asked, want)
 	}
 }
+
+// A temporary failure can recover while the same cover is shown, even with all thumbnail slots in use.
+func TestArtworkRecoversAfterNetworkFailure(t *testing.T) {
+	var data bytes.Buffer
+	if err := jpeg.Encode(&data, image.NewRGBA(image.Rect(0, 0, 8, 8)), nil); err != nil {
+		t.Fatal(err)
+	}
+	var online atomic.Bool
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if !online.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Write(data.Bytes())
+	}))
+	defer srv.Close()
+	posts := make(chan func(), 8)
+	c := newArtCache(func(fn func()) { posts <- fn })
+	for range cap(c.sem) {
+		c.sem <- struct{}{}
+	}
+	now := time.Unix(1e9, 0)
+	c.now = func() time.Time { return now }
+	key := sized(srv.URL, 600)
+	c.get(key, true)
+	runPost(t, posts)
+	failed := c.art[key+"#backdrop"]
+	if failed == nil || !failed.failed || failed.retryAt.IsZero() || requests.Load() != 2 {
+		t.Fatalf("weak network failure was not eligible for retry: %+v, requests=%d", failed, requests.Load())
+	}
+	now = failed.retryAt.Add(-time.Nanosecond)
+	c.get(key, true)
+	runPost(t, posts) // the visible failure schedules a redraw at its retry time
+	now = failed.retryAt
+	online.Store(true)
+	c.get(key, true)
+	runPost(t, posts)
+	if art := c.get(key, true); art == nil || art.bmp == nil || art.backdrop == nil {
+		t.Fatal("visible cover stayed failed after the connection recovered")
+	}
+}

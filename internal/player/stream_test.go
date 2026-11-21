@@ -1,7 +1,11 @@
 package player
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -9,11 +13,75 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"mygo-music/internal/music"
 )
+
+// If an audio response stalls mid-body, reconnect and verify the bytes before they are given to the decoder.
+func TestAudioTransferRecoversAfterStall(t *testing.T) {
+	for _, mode := range []string{"range", "no validator", "changed audio", "persistent stall"} {
+		t.Run(mode, func(t *testing.T) {
+			song := bytes.Repeat([]byte("abcdef"), 20_000)
+			half := len(song) / 2
+			var calls atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				const tag = `"song"`
+				if mode == "range" {
+					w.Header().Set("ETag", tag)
+				}
+				if calls.Add(1) == 1 || mode == "persistent stall" {
+					w.Header().Set("Content-Length", strconv.Itoa(len(song)))
+					w.Write(song[:half])
+					w.(http.Flusher).Flush()
+					<-r.Context().Done()
+					return
+				}
+				if mode == "range" {
+					if r.Header.Get("Range") != fmt.Sprintf("bytes=%d-", half) || r.Header.Get("If-Range") != tag {
+						t.Errorf("wrong resume headers: %v", r.Header)
+					}
+					w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", half, len(song)-1, len(song)))
+					w.WriteHeader(http.StatusPartialContent)
+					w.Write(song[half:])
+					return
+				}
+				if r.Header.Get("Range") != "" {
+					t.Error("resumed without a validator")
+				}
+				if mode == "changed audio" {
+					w.Write(bytes.Repeat([]byte("ghijkl"), 20_000))
+					return
+				}
+				w.Write(song)
+			}))
+			defer srv.Close()
+			ctx, cancel := context.WithTimeout(t.Context(), 4*time.Second)
+			defer cancel()
+			dl := &download{cancel: cancel, finished: make(chan struct{}), users: 2}
+			dl.cond.L = &dl.mu
+			defer dl.Close()
+			go dl.run(ctx, srv.URL, nil, 200*time.Millisecond)
+			data, err := io.ReadAll(&downloadReader{d: dl})
+			if mode == "persistent stall" {
+				if !errors.Is(err, music.ErrTransferIdle) || !bytes.Equal(data, song[:half]) {
+					t.Fatalf("stalled transfer returned %d bytes, err=%v", len(data), err)
+				}
+			} else if mode == "changed audio" {
+				if err == nil || !bytes.Equal(data, song[:half]) {
+					t.Fatalf("accepted changed audio: bytes=%d, err=%v", len(data), err)
+				}
+			} else if err != nil || !bytes.Equal(data, song) {
+				t.Fatalf("recovery returned %d of %d bytes, err=%v", len(data), len(song), err)
+			}
+			if n := calls.Load(); n != 2 {
+				t.Errorf("made %d requests, want two", n)
+			}
+		})
+	}
+}
 
 func TestFrameSize(t *testing.T) {
 	// MPEG-1 layer III, 320 kbps, 44.1 kHz, no padding.

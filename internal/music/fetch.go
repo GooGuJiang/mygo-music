@@ -1,7 +1,9 @@
 package music
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -20,6 +22,9 @@ const Agent = "MyGoMusic/1.0"
 // fetchClient gets covers: they're small, and a slow one shouldn't hold a
 // slot for long.
 var fetchClient = &http.Client{Timeout: 30 * time.Second}
+
+// ErrImageTemporary marks a cover that can be fetched again after a network failure.
+var ErrImageTemporary = errors.New("temporary image fetch failure")
 
 // maxFetch is the most a cover may take.
 const maxFetch = 64 << 20
@@ -52,12 +57,20 @@ var sizePlaceholder = regexp.MustCompile(`\{size\}|%7[Bb]size%7[Dd]`)
 
 // Fetch returns what's at url, of the web or a file://, such as a cover.
 func Fetch(u string) ([]byte, error) {
+	return FetchContext(context.Background(), u)
+}
+
+// FetchContext fetches a cover and stops waiting when ctx is canceled.
+func FetchContext(ctx context.Context, u string) ([]byte, error) {
 	if path, ok := PathOf(u); ok {
 		return os.ReadFile(path)
 	}
-	req, err := http.NewRequest("GET", u, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
 		return nil, err
+	}
+	if req.URL.Host == "" || req.URL.Scheme != "http" && req.URL.Scheme != "https" {
+		return nil, errors.New("invalid cover URL")
 	}
 	req.Header.Set("User-Agent", Agent)
 	var headers map[string]string
@@ -67,15 +80,94 @@ func Fetch(u string) ([]byte, error) {
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	res, err := HeadersStay(fetchClient, req.URL.Hostname(), headers).Do(req)
+	client := HeadersStay(fetchClient, req.URL.Hostname(), headers)
+	data, err := fetchImage(client, req)
+	if errors.Is(err, ErrImageTemporary) {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+			data, err = fetchImage(client, req)
+		}
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return data, err
+}
+
+func fetchImage(client *http.Client, req *http.Request) ([]byte, error) {
+	res, err := DoWithIdleTimeout(client, req, 7*time.Second)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrImageTemporary, err)
 	}
 	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
+	switch res.StatusCode {
+	case http.StatusOK:
+	case http.StatusRequestTimeout, http.StatusInternalServerError,
+		http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return nil, fmt.Errorf("%w: %s", ErrImageTemporary, res.Status)
+	default:
 		return nil, errors.New(res.Status)
 	}
-	return io.ReadAll(io.LimitReader(res.Body, maxFetch))
+	data, err := io.ReadAll(io.LimitReader(res.Body, maxFetch+1))
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrImageTemporary, err)
+	}
+	if len(data) > maxFetch {
+		return nil, errors.New("image response is too large")
+	}
+	return data, nil
+}
+
+// ErrTransferIdle signals that an HTTP request stopped receiving data.
+var ErrTransferIdle = errors.New("HTTP transfer stopped making progress")
+
+// DoWithIdleTimeout bounds the wait for headers and for each body read.
+// The caller must close the response body.
+func DoWithIdleTimeout(client *http.Client, req *http.Request, idle time.Duration) (*http.Response, error) {
+	ctx, cancel := context.WithCancelCause(req.Context())
+	timer := time.AfterFunc(idle, func() { cancel(ErrTransferIdle) })
+	res, err := client.Do(req.WithContext(ctx))
+	if !timer.Stop() {
+		cancel(ErrTransferIdle)
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		err = cause
+	}
+	if err != nil {
+		cancel(nil)
+		if res != nil {
+			res.Body.Close()
+		}
+		return nil, err
+	}
+	res.Body = &idleBody{ReadCloser: res.Body, ctx: ctx, cancel: cancel, idle: idle}
+	return res, nil
+}
+
+type idleBody struct {
+	io.ReadCloser
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+	idle   time.Duration
+}
+
+func (b *idleBody) Read(p []byte) (int, error) {
+	timer := time.AfterFunc(b.idle, func() { b.cancel(ErrTransferIdle) })
+	n, err := b.ReadCloser.Read(p)
+	if !timer.Stop() {
+		b.cancel(ErrTransferIdle)
+	}
+	if cause := context.Cause(b.ctx); cause != nil {
+		return n, cause
+	}
+	return n, err
+}
+
+func (b *idleBody) Close() error {
+	b.cancel(nil)
+	return b.ReadCloser.Close()
 }
 
 // HeadersStay returns client, or, with headers to send, one like it that

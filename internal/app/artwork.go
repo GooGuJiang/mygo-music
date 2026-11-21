@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -31,6 +32,7 @@ type artwork struct {
 	backdrop *ui.Bitmap
 	tint     ui.Color // the cover's most vivid color
 	failed   bool
+	retryAt  time.Time
 	used     time.Time // when it was last asked for
 	size     int       // the bytes it keeps: its data, and the backdrop's pixels
 }
@@ -54,7 +56,9 @@ type artCache struct {
 	loads   map[string]*artLoad
 	sources map[string]*artSource
 	sem     chan struct{}
-	pixels  *pixelBudget // of the covers decoding at once
+	large   chan struct{} // covers with backdrops have a slot of their own
+	retry   bool          // a redraw for visible covers that can be retried
+	pixels  *pixelBudget  // of the covers decoding at once
 	post    func(func())
 	now     func() time.Time
 	size    int // the bytes the covers in art keep
@@ -72,7 +76,7 @@ type artCache struct {
 const artLimit = 64 << 20
 
 func newArtCache(post func(func())) *artCache {
-	return &artCache{art: map[string]*artwork{}, gone: map[string]weak.Pointer[artwork]{}, busy: map[string]bool{}, loads: map[string]*artLoad{}, sources: map[string]*artSource{}, sem: make(chan struct{}, 8), pixels: newPixelBudget(decodePixels), post: post, now: time.Now, limit: artLimit}
+	return &artCache{art: map[string]*artwork{}, gone: map[string]weak.Pointer[artwork]{}, busy: map[string]bool{}, loads: map[string]*artLoad{}, sources: map[string]*artSource{}, sem: make(chan struct{}, 8), large: make(chan struct{}, 1), pixels: newPixelBudget(decodePixels), post: post, now: time.Now, limit: artLimit}
 }
 
 // add keeps a cover, and drops those asked for least recently once the
@@ -101,7 +105,9 @@ func (c *artCache) add(key string, a *artwork) {
 		a := c.art[key]
 		delete(c.art, key)
 		c.size -= a.size
-		c.gone[key] = weak.Make(a)
+		if !a.failed {
+			c.gone[key] = weak.Make(a)
+		}
 	}
 }
 
@@ -116,8 +122,18 @@ func (c *artCache) get(url string, backdrop bool) *artwork {
 	}
 	now := c.now()
 	if a, ok := c.art[key]; ok {
-		a.used = now
-		return a
+		if a.retryAt.IsZero() || now.Before(a.retryAt) {
+			a.used = now
+			if !a.retryAt.IsZero() && !c.retry {
+				c.retry = true
+				time.AfterFunc(a.retryAt.Sub(now), func() {
+					c.post(func() { c.retry = false })
+				})
+			}
+			return a
+		}
+		delete(c.art, key)
+		c.size -= a.size
 	}
 	if a := c.gone[key].Value(); a != nil {
 		delete(c.gone, key)
@@ -131,7 +147,7 @@ func (c *artCache) get(url string, backdrop bool) *artwork {
 	c.busy[key] = true
 	l := c.hold(url)
 	go func() {
-		c.load(url, l)
+		c.load(url, l, backdrop)
 		var blurred *image.RGBA
 		if l.err == nil && backdrop {
 			blurred = blurImage(l.img)
@@ -143,7 +159,11 @@ func (c *artCache) get(url string, backdrop bool) *artwork {
 			l.pixels = 0
 			c.tidyUp()
 			if l.err != nil {
-				c.add(key, &artwork{failed: true, used: c.now()})
+				a := &artwork{failed: true, used: c.now()}
+				if errors.Is(l.err, music.ErrImageTemporary) {
+					a.retryAt = a.used.Add(15 * time.Second)
+				}
+				c.add(key, a)
 				return
 			}
 			// A backdrop shares the bitmap of the cover it is of, which
@@ -222,15 +242,19 @@ func (c *artCache) letGo(key string, l *artLoad) {
 
 // load fetches and decodes the cover a key of sized names, on a goroutine,
 // unless another has: those after the first wait for it.
-func (c *artCache) load(key string, l *artLoad) {
+func (c *artCache) load(key string, l *artLoad, backdrop bool) {
 	l.once.Do(func() {
 		_, px := splitSized(key)
 		s := l.src
 		// A cover holds its place from its fetch to its decode, so that
 		// covers fetch no faster than they decode: those fetched waiting
 		// kept their data, megabytes each as sources give them.
-		c.sem <- struct{}{}
-		defer func() { <-c.sem }()
+		slots := c.sem
+		if backdrop {
+			slots = c.large
+		}
+		slots <- struct{}{}
+		defer func() { <-slots }()
 		s.once.Do(func() { s.data, s.err = music.Fetch(s.url) })
 		if l.err = s.err; l.err != nil {
 			return

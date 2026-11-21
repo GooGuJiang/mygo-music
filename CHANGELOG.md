@@ -2,6 +2,14 @@
 
 All notable changes to MyGo Music are written down here. Versions follow [Semantic Versioning](https://semver.org).
 
+## [0.1.32] - 2026-11-21
+
+### Fixed
+
+- A stalled next-track preload is detected and replaced instead of remaining at a small progress percentage. Stalled preloads can recover twice while the current song keeps playing.
+
+[0.1.32]: https://github.com/GooGuJiang/mygo-music/compare/v0.1.31...v0.1.32
+
 ## [0.1.31] - 2026-11-21
 
 ### Fixed

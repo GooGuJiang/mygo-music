@@ -121,6 +121,15 @@ func TestOpenRetriesTransferFailure(t *testing.T) {
 	}
 }
 
+// A preload that stops receiving bytes is replaced instead of remaining at a small progress percentage.
+func TestStalledAheadIsReplaced(t *testing.T) {
+	dl := &download{progressAt: time.Now().Add(-aheadStallAfter - time.Second)}
+	dl.cond.L = &dl.mu
+	if !dl.stalled(aheadStallAfter) {
+		t.Fatal("stalled download was not detected")
+	}
+}
+
 // A failed preload is retried once during the current song so AutoMix can still make the handoff.
 func TestAutomixRetriesFailedPreload(t *testing.T) {
 	for _, persistent := range []bool{false, true} {

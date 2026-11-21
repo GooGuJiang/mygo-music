@@ -11,9 +11,10 @@ import (
 )
 
 const (
-	automixOverlap = 2500 * time.Millisecond
-	automixLead    = 850 * time.Millisecond
-	automixAhead   = 250 * time.Millisecond // audio.LatencyPlayback
+	automixOverlap  = 2500 * time.Millisecond
+	automixLead     = 850 * time.Millisecond
+	automixAhead    = 250 * time.Millisecond // audio.LatencyPlayback
+	aheadStallAfter = 10 * time.Second
 )
 
 type nextRhythm struct {
@@ -236,7 +237,7 @@ type ahead struct {
 	info                *music.Stream
 	dl                  *download // nil for a song on disk, which opens at once
 	err                 error
-	retried             bool // one fresh lookup while the same track is next
+	retries             int // bounded fresh lookups while the same track is next
 }
 
 func (a *ahead) is(t music.Track, quality string) bool {
@@ -266,7 +267,7 @@ func (a *ahead) transfer() (ready bool, err error, progress float64) {
 
 func (p *Player) retryAhead(quality string) {
 	a := p.ahead
-	if a == nil || a.retried {
+	if a == nil {
 		return
 	}
 	t, ok := p.upNext()
@@ -274,15 +275,21 @@ func (p *Player) retryAhead(quality string) {
 		return
 	}
 	_, err, _ := a.transfer()
+	stalled := a.dl != nil && a.dl.stalled(aheadStallAfter)
+	if err != nil && a.retries >= 1 || stalled && a.retries >= 2 {
+		return
+	}
 	switch {
-	case err == nil, errors.Is(err, context.Canceled), errors.Is(err, music.ErrUnavailable),
+	case err == nil && !stalled, errors.Is(err, context.Canceled), errors.Is(err, music.ErrUnavailable),
 		errors.Is(err, music.ErrSignIn), errors.Is(err, music.ErrSetup), errors.Is(err, music.ErrUnsupported):
 		return
 	}
+	a.retries++
+	retries := a.retries
 	p.dropAhead()
 	p.getAhead(quality)
 	if p.ahead != nil {
-		p.ahead.retried = true
+		p.ahead.retries = retries
 	}
 	// A panel that was showing a failure stopped polling for preload progress.
 	p.post(func() {})

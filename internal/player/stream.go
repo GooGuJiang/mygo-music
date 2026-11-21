@@ -30,16 +30,17 @@ import (
 // app's memory, as much again as the song. Songs the cache would not keep
 // come into memory.
 type download struct {
-	mu       sync.Mutex
-	cond     sync.Cond
-	file     *os.File // where the song is, or nil: then data
-	data     []byte
-	n        int64 // the bytes in so far
-	size     int64 // expected, or 0 if unknown
-	done     bool
-	err      error
-	cancel   context.CancelFunc
-	finished chan struct{} // closed when the network transfer stops
+	mu         sync.Mutex
+	cond       sync.Cond
+	file       *os.File // where the song is, or nil: then data
+	data       []byte
+	n          int64 // the bytes in so far
+	size       int64 // expected, or 0 if unknown
+	done       bool
+	err        error
+	cancel     context.CancelFunc
+	finished   chan struct{} // closed when the network transfer stops
+	progressAt time.Time     // last byte received, for a stalled preload watchdog
 	// part is the file's path until the cache keeps it, which keep does
 	// once the song has all come in: the path it is at then.
 	part    string
@@ -59,7 +60,7 @@ type download struct {
 // without one.
 func startDownload(url string, size int64, headers map[string]string, part *os.File, keep func(string, int64) (string, bool)) *download {
 	ctx, cancel := context.WithCancel(context.Background())
-	d := &download{size: size, cancel: cancel, finished: make(chan struct{}), users: 2}
+	d := &download{size: size, cancel: cancel, finished: make(chan struct{}), progressAt: time.Now(), users: 2}
 	d.cond.L = &d.mu
 	switch {
 	case part != nil:
@@ -228,8 +229,15 @@ func (d *download) write(b []byte) {
 		d.data = append(d.data, b...)
 	}
 	d.n += int64(len(b))
+	d.progressAt = time.Now()
 	d.cond.Broadcast()
 	d.mu.Unlock()
+}
+
+func (d *download) stalled(after time.Duration) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return !d.done && !d.progressAt.IsZero() && time.Since(d.progressAt) >= after
 }
 
 // toMemory moves the song into memory from a file that takes no more, as

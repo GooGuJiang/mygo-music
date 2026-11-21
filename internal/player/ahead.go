@@ -2,7 +2,6 @@ package player
 
 import (
 	"context"
-	"math"
 	"sync/atomic"
 	"time"
 
@@ -102,17 +101,13 @@ func (p *Player) scheduleAutomix(out *audio.Player) {
 		if p.out != out {
 			return
 		}
-		position := out.Position()
+		position := p.watch.sourceTime(out.Position())
 		remaining := out.Duration() - position
 		if remaining <= 0 {
 			p.cancelAutomixPrep()
 			return
 		}
 		wait := min(time.Second, max(150*time.Millisecond, remaining-5*time.Second))
-		if speed := out.Speed(); missedCue && speed != 1 {
-			out.SetSpeed(stepAutomixSpeed(speed, 1, automixTempoTick))
-			wait = min(wait, automixTempoTick)
-		}
 		quality := p.playbackQuality()
 		if p.ahead != nil && p.ahead.quality != quality {
 			p.refreshAhead()
@@ -141,7 +136,17 @@ func (p *Player) scheduleAutomix(out *audio.Player) {
 							cut := native.cut
 							plan = automixPlan{bridge: true, target: cut.outBeat - cut.lead, cue: cut.inBeat - cut.lead,
 								overlap: cut.lead + cut.tail, pivot: cut.lead, native: native}
-						} else if plan = matchBars(pair.out, pair.in, out.Duration(), position); plan.count == 0 {
+						} else {
+							plan = matchBars(pair.out, pair.in, out.Duration(), position)
+							if plan.changesTempo() {
+								if p.watch != nil && loadRubberBand() != nil && plan.rampStart-automixTempoPreroll > position+automixLoopDecodeLead {
+									plan.tempo = newAutomixTempo(&plan, p.watch.SampleRate())
+								} else {
+									plan = automixPlan{}
+								}
+							}
+						}
+						if !plan.timed() {
 							if loop := pair.loop; loop != nil && p.watch != nil && p.watch.rhythm == s && loop.rate == p.watch.SampleRate() &&
 								position+automixLoopDecodeLead < loop.cut.end-loop.cut.voice {
 								plan = automixPlan{bridge: true, cue: loop.cut.cue, target: loop.cut.target(), overlap: automixLoopTail, loop: loop}
@@ -150,7 +155,7 @@ func (p *Player) scheduleAutomix(out *audio.Player) {
 							}
 						}
 						// Give stem analysis time to finish without missing a usable downbeat.
-						rampDue := plan.count > 0 && plan.bars[0].speed != 1 && plan.rampStart-position <= time.Second
+						rampDue := plan.tempo != nil && plan.rampStart-position <= automixLoopDecodeLead+automixTempoPreroll+1500*time.Millisecond
 						if plan.timed() && (plan.native != nil || plan.loop != nil && pair.nativeReady || pair.stemsReady || rampDue || plan.target-position <= 5*time.Second) {
 							if !pair.stemsReady {
 								p.nextRhythm.cancel()
@@ -158,6 +163,7 @@ func (p *Player) scheduleAutomix(out *audio.Player) {
 							p.automixPrep = &automixPreparation{plan: plan, next: p.nextRhythm, out: out, watch: p.watch}
 							if p.watch != nil {
 								p.watch.setAutomix(&plan, false)
+								p.watch.tempo.Store(plan.tempo)
 							}
 						}
 					}
@@ -166,26 +172,21 @@ func (p *Player) scheduleAutomix(out *audio.Player) {
 				p.cancelAutomixPrep()
 			}
 			if prep := p.automixPrep; prep != nil {
-				position = automixMixPosition(out)
 				plan := &prep.plan
-				delta := plan.target - position
-				speed, next := plan.approach(position)
+				delta := plan.tempo.mapTime(plan.target, true) - automixMixPosition(out)
 				switch {
+				case plan.tempo != nil && plan.tempo.failed.Load():
+					p.cancelAutomixPrep()
+					wait = min(wait, automixTempoTick)
 				case delta > automixLead:
-					if out.Speed() != speed {
-						out.SetPreservesPitch(true).SetSpeed(speed)
-					}
-					wait = min(wait, time.Duration(float64(min(next-position, delta-automixLead))/speed))
-				case delta > 80*time.Millisecond && math.Abs(out.Speed()-speed) <= .02:
+					wait = min(wait, delta-automixLead)
+				case delta > 80*time.Millisecond && (plan.tempo == nil || plan.tempo.started.Load()):
 					p.automixPrep = nil // handoff takes ownership of the running transition
 					p.loadTrack((p.at+1)%len(p.order), 0, forward, true, plan.cue, plan.overlap, plan)
 					return
 				default:
-					// Keep playing the current track if we missed the cue. Give its tempo time to settle.
-					missedCue, p.automixPrep = true, nil
-					if prep.watch != nil {
-						prep.watch.setAutomix(nil, false)
-					}
+					missedCue = true
+					p.cancelAutomixPrep()
 					wait = min(wait, automixTempoTick)
 				}
 			}

@@ -26,7 +26,9 @@ type watched struct {
 	rhythm     *demucsStream
 	clickGain  atomic.Uint64 // the click's float64 gain, or zero while off
 	automix    atomic.Pointer[automixEQ]
+	tempo      atomic.Pointer[automixTempo]
 	bands      automixBands
+	stretch    *automixStretch // decoder goroutine only
 	frame      int64
 }
 
@@ -57,6 +59,30 @@ func (w *watched) setAutomix(plan *automixPlan, incoming bool) {
 
 func (w *watched) Read(dst []float32) (int, error) {
 	defer w.begin()()
+	if w.stretch != nil {
+		return w.stretch.read(w, dst)
+	}
+	if tempo := w.tempo.Load(); tempo != nil {
+		switch {
+		case w.frame < tempo.first:
+			return w.readPCM(dst[:min(int64(len(dst)), 2*(tempo.first-w.frame))])
+		case w.frame == tempo.first:
+			tempo.started.Store(true)
+			if api := loadRubberBand(); api != nil && w.tempo.Load() == tempo {
+				if state := api.open(uint32(w.SampleRate())); state != 0 {
+					rate := w.SampleRate()
+					w.stretch = &automixStretch{api: api, state: state, tempo: tempo, rate: rate, output: w.frame, seam: make([]float32, 0, 2*(rate/20))}
+					return w.stretch.read(w, dst)
+				}
+			}
+		}
+		tempo.failed.Store(true)
+		w.tempo.CompareAndSwap(tempo, nil)
+	}
+	return w.readPCM(dst)
+}
+
+func (w *watched) readPCM(dst []float32) (int, error) {
 	n, err := w.stream.Read(dst)
 	frame := w.frame
 	if eq := w.automix.Load(); eq != nil && n > 0 {
@@ -79,6 +105,7 @@ func (w *watched) Read(dst []float32) (int, error) {
 
 func (w *watched) SetPosition(frame int64) error {
 	defer w.begin()()
+	w.closeStretch()
 	if err := w.stream.SetPosition(frame); err != nil {
 		if first := w.firstRead; first != nil && frame >= w.firstFrame {
 			w.firstRead = nil
@@ -89,6 +116,25 @@ func (w *watched) SetPosition(frame int64) error {
 	w.frame = frame
 	w.bands = automixBands{}
 	return nil
+}
+
+func (w *watched) closeStretch() {
+	if w.stretch != nil {
+		w.stretch.api.close(w.stretch.state)
+		w.stretch = nil
+	}
+}
+
+func (w *watched) Close() error {
+	w.closeStretch()
+	return w.stream.Close()
+}
+
+func (w *watched) sourceTime(at time.Duration) time.Duration {
+	if w != nil {
+		return w.tempo.Load().mapTime(at, false)
+	}
+	return at
 }
 
 func (w *watched) begin() func() {

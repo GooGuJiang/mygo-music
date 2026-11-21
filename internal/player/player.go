@@ -666,7 +666,7 @@ func (p *Player) Position() time.Duration {
 	case p.seeking:
 		return p.seekTo
 	}
-	return p.out.Position()
+	return p.watch.sourceTime(p.out.Position())
 }
 
 func (p *Player) Duration() time.Duration {
@@ -920,7 +920,7 @@ func (p *Player) loadTrack(at, skipped, dir int, play bool, from, overlap time.D
 						return
 					}
 					if mix.timed() {
-						wait := mix.target - automixMixPosition(outgoing)
+						wait := mix.tempo.mapTime(mix.target, true) - automixMixPosition(outgoing)
 						atCue := (p.out.Position() - mix.cue).Abs() < time.Millisecond
 						ready := buffered && p.handoff == outgoing && outgoing.Playing() && p.Automix() && s.Channels() == 2 &&
 							atCue && (p.Dolby == nil || !p.Dolby().Spatial)
@@ -930,7 +930,7 @@ func (p *Player) loadTrack(at, skipped, dir int, play bool, from, overlap time.D
 							late = 45 * time.Millisecond
 						}
 						if ready && wait > 5*time.Millisecond {
-							p.after(time.Duration(float64(wait)/outgoing.Speed()), func() { p.post(func() { begin(buffered) }) })
+							p.after(wait, func() { p.post(func() { begin(buffered) }) })
 							return
 						}
 						if !ready || wait < -late {
@@ -947,7 +947,7 @@ func (p *Player) loadTrack(at, skipped, dir int, play bool, from, overlap time.D
 							if atCue {
 								p.out.Seek(0)
 							}
-							mix = &automixPlan{target: automixMixPosition(outgoing), overlap: overlap}
+							mix = &automixPlan{target: outgoingWatch.sourceTime(automixMixPosition(outgoing)), overlap: overlap}
 							if p.handoff == outgoing {
 								p.automixMix = mix
 							}
@@ -956,10 +956,14 @@ func (p *Player) loadTrack(at, skipped, dir int, play bool, from, overlap time.D
 					if p.handoff == outgoing && outgoing.Playing() {
 						duration := overlap
 						if !mix.timed() {
-							remaining := outgoing.Duration() - automixMixPosition(outgoing)
+							end := outgoing.Duration()
+							if outgoingWatch != nil {
+								end = outgoingWatch.tempo.Load().mapTime(end, true)
+							}
+							remaining := end - automixMixPosition(outgoing)
 							duration = min(overlap, max(trackHandoffFade, remaining))
 							if mix != nil {
-								p.automixMix = &automixPlan{target: automixMixPosition(outgoing), overlap: duration}
+								p.automixMix = &automixPlan{target: outgoingWatch.sourceTime(automixMixPosition(outgoing)), overlap: duration}
 							}
 						}
 						p.fade.setHandoff(outgoing, mix)

@@ -114,33 +114,25 @@ func TestAutomixApproachesTempoWithoutAStep(t *testing.T) {
 	}
 }
 
-// Bar changes and late fallbacks cannot step the playing deck straight to the next requested speed.
-func TestAutomixHandoffLimitsSpeedChanges(t *testing.T) {
-	out, in := audio.NewPlayer(silence{}), audio.NewPlayer(silence{})
-	t.Cleanup(out.Close)
-	t.Cleanup(in.Close)
-	start := time.Unix(0, 0)
-	plan := &automixPlan{count: 2, overlap: 4 * time.Second, bars: [automixBars]automixBar{
-		{in: 2 * time.Second, out: 2080 * time.Millisecond, speed: 1.04},
-		{in: 2 * time.Second, out: 2200 * time.Millisecond, speed: 1.1},
+// The decoder and scheduler share the same split-bar anchors and track clock.
+func TestAutomixTempoMapsBeatAndTrackTime(t *testing.T) {
+	plan := &automixPlan{count: 2, rampStart: 4 * time.Second, target: 7 * time.Second, bars: [automixBars]automixBar{
+		{in: 2 * time.Second, out: 2160 * time.Millisecond, inSplit: time.Second, outSplit: 1060 * time.Millisecond, speed: 1.06, nextSpeed: 1.10},
+		{in: 2 * time.Second, out: 2180 * time.Millisecond, speed: 1.09},
 	}}
-	out.SetSpeed(1.04)
-	f := fader{out: in, gain: 1, to: 1, start: start, dur: plan.overlap}
-	f.setHandoff(out, plan)
-	if out.Speed() != 1.04 {
-		t.Fatalf("starting handoff changed speed immediately to %.6f", out.Speed())
+	warp := newAutomixTempo(plan, 48000)
+	start := warp.mapTime(plan.target, true)
+	if start >= plan.target || start < plan.rampStart {
+		t.Fatalf("unexpected playback cue %s for source %s", start, plan.target)
 	}
-	at := start.Add(2 * time.Second)
-	f.tempoAt = at.Add(-8 * time.Millisecond)
-	f.apply(at)
-	barChange := out.Speed()
-	if barChange <= 1.04 || barChange > 1.04121 {
-		t.Fatalf("bar boundary changed speed too quickly: %.6f", barChange)
+	for _, elapsed := range []time.Duration{0, time.Second, 2 * time.Second, 3 * time.Second, 4 * time.Second} {
+		source, _ := plan.alignment(elapsed)
+		if got := warp.mapTime(start+elapsed, false); (got - source).Abs() > time.Microsecond {
+			t.Fatalf("at %s mapped to %s, want %s", elapsed, got, source)
+		}
 	}
-	f.mix = nil
-	f.apply(at.Add(8 * time.Millisecond))
-	if speed := out.Speed(); speed >= barChange || speed < barChange-.00121 {
-		t.Fatalf("fallback reset speed from %.6f to %.6f", barChange, speed)
+	if got := warp.mapTime(plan.outEnd()+time.Second, true); got != start+5*time.Second {
+		t.Fatalf("post-transition playback did not return to its original rate: %s", got)
 	}
 }
 

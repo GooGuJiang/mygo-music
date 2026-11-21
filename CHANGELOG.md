@@ -2,6 +2,14 @@
 
 All notable changes to MyGo Music are written down here. Versions follow [Semantic Versioning](https://semver.org).
 
+## [0.1.28] - 2026-11-21
+
+### Fixed
+
+- On Windows x64, AutoMix uses Rubber Band R3 to preserve pitch during beat-matched tempo changes. It blends into the stretched audio smoothly and can fall back to an original-tempo handoff or a crossfade if the engine is unavailable.
+
+[0.1.28]: https://github.com/GooGuJiang/mygo-music/compare/v0.1.27...v0.1.28
+
 ## [0.1.27] - 2026-11-21
 
 ### Fixed

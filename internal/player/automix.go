@@ -34,6 +34,7 @@ type automixPlan struct {
 	stems                automixStemTiming
 	loop                 *automixLoopAudio
 	native               *automixNativeMix
+	tempo                *automixTempo
 }
 
 func (m *automixPlan) timed() bool { return m != nil && (m.count > 0 || m.bridge) }
@@ -133,15 +134,17 @@ func (p *Player) estimatedAutomixPoint() (time.Duration, bool) {
 		return 0, false
 	}
 	point := p.out.Duration() - automixOverlap
-	return point, p.out.Position() <= point
+	return point, p.Position() <= point
 }
 
 func (p *Player) cancelAutomixPrep() {
 	if prep := p.automixPrep; prep != nil {
 		p.automixPrep = nil
-		prep.out.SetSpeed(1).SetPreservesPitch(false)
 		if prep.watch != nil {
 			prep.watch.setAutomix(nil, false)
+			if tempo := prep.watch.tempo.Swap(nil); tempo != nil && tempo.started.Load() {
+				prep.out.Seek(tempo.mapTime(prep.out.Position(), false))
+			}
 		}
 	}
 }
@@ -149,7 +152,7 @@ func (p *Player) cancelAutomixPrep() {
 func automixMixPosition(out *audio.Player) time.Duration {
 	position := out.Position()
 	if audio.Err() == nil {
-		position += time.Duration(float64(automixAhead) * out.Speed())
+		position += automixAhead
 	}
 	return position
 }

@@ -5,7 +5,7 @@ export default ({ command }: { command: string }) => ({
   name: "MyGo Music",
   identifier: "dev.egoist.music",
   slug: "mygo-music",
-  version: "0.1.31",
+  version: "0.1.32",
   out: "build",
   resourcesExclude: [
     "windows-amd64/demucs/.runtime",

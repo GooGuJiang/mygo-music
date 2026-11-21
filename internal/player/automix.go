@@ -84,7 +84,9 @@ func (p *Player) AutomixInfo() AutomixInfo {
 		if next, ok := p.upNext(); ok {
 			info.Next = next.Name
 			if a := p.ahead; a != nil && a.is(next, p.playbackQuality()) {
-				info.Ready, info.PreloadFailed, info.Progress = a.transfer()
+				var err error
+				info.Ready, err, info.Progress = a.transfer()
+				info.PreloadFailed = err != nil
 				info.Preloading = !info.Ready && !info.PreloadFailed
 			}
 		}
@@ -128,6 +130,13 @@ func (p *Player) estimatedAutomixPoint() (time.Duration, bool) {
 	}
 	t, ok := p.upNext()
 	if !ok || t.ShowID != "" || p.out.Duration() < 2*automixOverlap {
+		return 0, false
+	}
+	a := p.ahead
+	if a == nil || !a.is(t, p.playbackQuality()) {
+		return 0, false
+	}
+	if ready, _, _ := a.transfer(); !ready {
 		return 0, false
 	}
 	if src := p.sourceOf(&t); src == nil || src.Info().Playback == music.PlaybackRemote {

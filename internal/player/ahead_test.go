@@ -90,6 +90,60 @@ func TestFailedAheadGetsFreshStream(t *testing.T) {
 	}
 }
 
+// A failed preload is retried once during the current song so AutoMix can still make the handoff.
+func TestAutomixRetriesFailedPreload(t *testing.T) {
+	for _, persistent := range []bool{false, true} {
+		name := "recovers"
+		if persistent {
+			name = "stops after one retry"
+		}
+		t.Run(name, func(t *testing.T) {
+			data, err := os.ReadFile("testdata/seek.mp3")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var requests atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if requests.Add(1) == 1 || persistent {
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
+				w.Write(data)
+			}))
+			defer srv.Close()
+			_, p := posted()
+			t.Cleanup(p.stop)
+			p.Cue([]music.Track{{ID: "a", Source: "s"}, {ID: "b", Source: "s", Name: "Calling"}})
+			src := &served{url: srv.URL, asked: map[string]int{}}
+			p.Source = func(string) music.Source { return src }
+			p.Automix = func() bool { return true }
+			var tick func()
+			p.after = func(_ time.Duration, fn func()) { tick = fn }
+			p.Quiet = func(fn func()) { fn() }
+			p.scheduleAutomix(p.out)
+			p.getAhead(p.playbackQuality())
+			eventually(t, "first preload did not fail", func() bool { return p.AutomixInfo().PreloadFailed })
+			first := p.ahead
+			tick()
+			retry := p.ahead
+			if retry == first {
+				t.Fatal("left the failed preload in place until the song ended")
+			}
+			eventually(t, "retry did not settle", func() bool {
+				info := p.AutomixInfo()
+				return (persistent && info.PreloadFailed) || (!persistent && info.Ready)
+			})
+			tick()
+			if p.ahead != retry || src.count(src.asked, "b") != 2 || requests.Load() != 2 {
+				t.Fatalf("expected one fresh lookup, got %d lookups and %d downloads", src.count(src.asked, "b"), requests.Load())
+			}
+			if p.Current().ID != "a" || !p.out.Playing() {
+				t.Fatal("preload interrupted the current song")
+			}
+		})
+	}
+}
+
 // Automix waits for the incoming audio and uses an ordinary fade for PCM or an unreliable beat grid.
 func TestAutomixWaitsForNextTrack(t *testing.T) {
 	t.Run("PCM", func(t *testing.T) { testAutomixHandoff(t, false) })

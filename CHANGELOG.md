@@ -2,6 +2,14 @@
 
 All notable changes to MyGo Music are written down here. Versions follow [Semantic Versioning](https://semver.org).
 
+## [0.1.30] - 2026-11-21
+
+### Fixed
+
+- AutoMix retries a failed preload once while the current song is still playing. The estimated transition point appears once the next track is ready.
+
+[0.1.30]: https://github.com/GooGuJiang/mygo-music/compare/v0.1.29...v0.1.30
+
 ## [0.1.29] - 2026-11-21
 
 ### Fixed

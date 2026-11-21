@@ -2,6 +2,7 @@ package player
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"time"
 
@@ -116,13 +117,17 @@ func (p *Player) scheduleAutomix(out *audio.Player) {
 		if !enabled {
 			p.clearNextRhythm()
 		}
+		canPrepare := enabled && p.playing && out.Playing() && !p.seeking && !p.Loading() && p.handoff == nil
+		if canPrepare {
+			p.retryAhead(quality)
+		}
 		lookahead := 45 * time.Second
 		if s != nil && s.engine != nil {
 			if device := s.engine.device.Load(); device != nil && *device == DemucsCPU {
 				lookahead = 2 * time.Minute
 			}
 		}
-		if enabled && remaining <= lookahead && p.playing && out.Playing() && !p.seeking && !p.Loading() && p.handoff == nil && p.automixReady(quality) {
+		if canPrepare && remaining <= lookahead && p.automixReady(quality) {
 			if s != nil && s.engine != nil && !s.failed.Load() && s.engine.rhythm.Load() {
 				p.prepareNextRhythm(s, quality, out.Duration())
 				if prep := p.automixPrep; prep != nil && prep.next != p.nextRhythm {
@@ -231,23 +236,24 @@ type ahead struct {
 	info                *music.Stream
 	dl                  *download // nil for a song on disk, which opens at once
 	err                 error
+	retried             bool // one fresh lookup while the same track is next
 }
 
 func (a *ahead) is(t music.Track, quality string) bool {
 	return a.source == t.Source && a.id == t.ID && a.quality == quality
 }
 
-func (a *ahead) transfer() (ready, failed bool, progress float64) {
+func (a *ahead) transfer() (ready bool, err error, progress float64) {
 	select {
 	case <-a.done:
 	default:
-		return false, false, 0
+		return false, nil, 0
 	}
 	if a.err != nil {
-		return false, true, 0
+		return false, a.err, 0
 	}
 	if a.dl == nil {
-		return true, false, 1 // file URL
+		return true, nil, 1 // file URL
 	}
 	d := a.dl
 	d.mu.Lock()
@@ -255,7 +261,31 @@ func (a *ahead) transfer() (ready, failed bool, progress float64) {
 	if d.size > 0 {
 		progress = min(1, float64(d.n)/float64(d.size))
 	}
-	return d.done && d.err == nil, d.done && d.err != nil, progress
+	return d.done && d.err == nil, d.err, progress
+}
+
+func (p *Player) retryAhead(quality string) {
+	a := p.ahead
+	if a == nil || a.retried {
+		return
+	}
+	t, ok := p.upNext()
+	if !ok || !a.is(t, quality) {
+		return
+	}
+	_, err, _ := a.transfer()
+	switch {
+	case err == nil, errors.Is(err, context.Canceled), errors.Is(err, music.ErrUnavailable),
+		errors.Is(err, music.ErrSignIn), errors.Is(err, music.ErrSetup), errors.Is(err, music.ErrUnsupported):
+		return
+	}
+	p.dropAhead()
+	p.getAhead(quality)
+	if p.ahead != nil {
+		p.ahead.retried = true
+	}
+	// A panel that was showing a failure stopped polling for preload progress.
+	p.post(func() {})
 }
 
 func (p *Player) refreshAhead() {

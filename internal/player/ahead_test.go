@@ -1,6 +1,7 @@
 package player
 
 import (
+	"context"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -87,6 +88,36 @@ func TestFailedAheadGetsFreshStream(t *testing.T) {
 	settle(t, posts, p)
 	if p.Current().ID != "b" || p.Err() != "" || src.count(src.asked, "b") != 2 || requests.Load() != 2 {
 		t.Fatalf("failed preload was not replaced: %v, %q, requests=%d", p.Current(), p.Err(), requests.Load())
+	}
+}
+
+// A fresh transfer gets bounded source refreshes when the CDN keeps failing.
+func TestOpenRetriesTransferFailure(t *testing.T) {
+	data, err := os.ReadFile("testdata/seek.mp3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requests.Add(1) <= 4 {
+			w.WriteHeader(http.StatusGatewayTimeout)
+			return
+		}
+		w.Write(data)
+	}))
+	defer srv.Close()
+	_, p := posted()
+	t.Cleanup(p.stop)
+	track := music.Track{ID: "b", Source: "s", Duration: 5000}
+	src := &served{url: srv.URL, asked: map[string]int{}}
+	p.Source = func(string) music.Source { return src }
+	_, stream, err := p.open(context.Background(), src, track, p.playbackQuality(), nil)
+	if err != nil {
+		t.Fatalf("fresh transfer did not recover: %v", err)
+	}
+	stream.Close()
+	if requests.Load() != 5 || src.count(src.asked, "b") != 3 {
+		t.Fatalf("expected two failed downloads and one recovery, got %d HTTP requests and %d source lookups", requests.Load(), src.count(src.asked, "b"))
 	}
 }
 

@@ -1148,6 +1148,10 @@ var errNoSource = errors.New("player: no such source")
 // there, or else streamed into the cache, and kept once it has all come in.
 // What failed ahead is asked for again: it may have been a moment's.
 func (p *Player) open(ctx context.Context, src music.Source, t music.Track, quality string, pre *ahead) (*music.Stream, stream, error) {
+	return p.openAttempt(ctx, src, t, quality, pre, 2)
+}
+
+func (p *Player) openAttempt(ctx context.Context, src music.Source, t music.Track, quality string, pre *ahead, retries int) (*music.Stream, stream, error) {
 	if err := ctx.Err(); err != nil {
 		if pre != nil {
 			pre.close()
@@ -1184,7 +1188,6 @@ func (p *Player) open(ctx context.Context, src music.Source, t music.Track, qual
 			}
 		}
 	}
-	usingAhead := ok
 	if !ok {
 		dl, info, ok = p.Cache.lookup(t.Source, t.ID, quality)
 	}
@@ -1221,8 +1224,8 @@ func (p *Player) open(ctx context.Context, src music.Source, t music.Track, qual
 		transferErr := dl.failure()
 		dl.Close()
 		if transferErr != nil {
-			if usingAhead && ctx.Err() == nil {
-				return p.open(ctx, src, t, quality, nil)
+			if retries > 0 && ctx.Err() == nil {
+				return p.openAttempt(ctx, src, t, quality, nil, retries-1)
 			}
 			return nil, nil, transferErr
 		}

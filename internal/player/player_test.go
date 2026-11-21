@@ -81,6 +81,37 @@ func TestPauseFades(t *testing.T) {
 	}
 }
 
+// A prepared outgoing loop still fades the incoming deck in instead of starting it at full volume.
+func TestPreparedLoopFadesIncomingDeck(t *testing.T) {
+	out := audio.NewPlayer(silence{})
+	in := audio.NewPlayer(silence{})
+	t.Cleanup(out.Close)
+	t.Cleanup(in.Close)
+	f := &fader{
+		out:         in,
+		handoff:     out,
+		handoffGain: .8,
+		gain:        1,
+		from:        0,
+		to:          1,
+		start:       time.Now(),
+		dur:         time.Second,
+		mix:         &automixPlan{bridge: true, overlap: time.Second, loop: &automixLoopAudio{}},
+	}
+	f.apply(f.start)
+	if got := in.Volume(); got != 0 {
+		t.Fatalf("incoming deck started at %g", got)
+	}
+	f.apply(f.start.Add(500 * time.Millisecond))
+	if got := in.Volume(); got <= 0 || got >= 1 {
+		t.Fatalf("incoming deck did not fade in: %g", got)
+	}
+	f.apply(f.start.Add(time.Second))
+	if got := in.Volume(); got != 1 {
+		t.Fatalf("incoming deck ended at %g", got)
+	}
+}
+
 // A seek playing pauses, which fades out over a few milliseconds, and
 // plays again once there, its position the one asked for meanwhile.
 func TestSeekWithoutClick(t *testing.T) {

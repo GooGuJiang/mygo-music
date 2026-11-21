@@ -167,7 +167,7 @@ func (s automixStemSource) render(from, end time.Duration, c automixLoopCut, res
 	if c.end > c.start {
 		start, seam = frameAt(c.start), frameAt(c.end)
 		length = seam - start
-		first, limit = min(begin, start-edge), max(seam, finish-length)
+		first, limit = min(begin, start-edge), finish
 		if length <= edge || finish <= seam {
 			return nil
 		}
@@ -213,6 +213,12 @@ func (s automixStemSource) render(from, end time.Duration, c automixLoopCut, res
 				if length != 0 && i >= seam-edge && i < seam {
 					blend := float32(automixRampProgress(int64(i), int64(seam-edge), int64(seam)))
 					sample += blend * (read(i-length, stem, ch) - sample)
+				}
+				if length != 0 && i >= seam+length {
+					resume := read(i, stem, ch)
+					end := seam + length + s.rate*int(automixLoopTail/time.Millisecond)/1000
+					blend := float32(automixRampProgress(int64(i), int64(seam+length), int64(end)))
+					sample += blend * (resume - sample)
 				}
 				mixed := gain * sample
 				if filter.at != 0 {

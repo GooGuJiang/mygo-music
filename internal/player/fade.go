@@ -49,8 +49,17 @@ func (f *fader) apply(now time.Time) {
 	level := f.level(now)
 	gain := f.gain * level
 	if f.handoff != nil && f.mix.preparedAudio(false) != nil {
-		// Both decks use their decoded stem envelopes where provided.
-		f.out.SetVolume(f.gain)
+		// A prepared outgoing loop owns its fade, while the incoming deck still needs the handoff ramp.
+		f.handoff.SetVolume(f.gain)
+		if f.mix.preparedAudio(true) != nil {
+			f.out.SetVolume(f.gain)
+			return
+		}
+		if f.mix.bridge {
+			level = f.mix.bridgeProgress(level)
+		}
+		_, gain = handoffGains(level, f.handoffGain, f.gain)
+		f.out.SetVolume(gain)
 		return
 	}
 	if f.handoff != nil {

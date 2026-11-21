@@ -104,6 +104,31 @@ func TestAutomixLoopPlaysSeparatedRepeat(t *testing.T) {
 	}
 }
 
+// After the repeated bar, the loop exits into the natural playhead instead of replaying the OUT tail.
+func TestAutomixLoopResumesNaturalPlayhead(t *testing.T) {
+	const rate = 48000
+	cut := automixLoopCut{start: time.Second, end: 3 * time.Second, voice: 400 * time.Millisecond}
+	dry := make([]float32, 2*7*rate)
+	for frame := range len(dry) / 2 {
+		dry[2*frame], dry[2*frame+1] = float32(frame)/rate, float32(frame)/rate
+	}
+	split := make([][2 * demucsOther]float32, len(dry)/2)
+	source := automixStemSource{timeline: &beatTimeline{}, rate: rate, dry: dry, split: split}
+	begin, pivot := cut.end-cut.voice, cut.target()
+	loop := source.render(begin, pivot+automixLoopTail, cut, false, automixLowpassTail{}, func(time.Duration) [demucsStemCount]float32 {
+		return [demucsStemCount]float32{demucsOther: 1}
+	})
+	if loop == nil {
+		t.Fatal("no audio for a fully analyzed repeat")
+	}
+	frame := func(at time.Duration) float32 {
+		return loop.frames[int((at-begin)*rate/time.Second)][2*demucsOther]
+	}
+	if got := frame(pivot + 100*time.Millisecond); got <= 2.1 {
+		t.Fatalf("loop exit still replayed the OUT tail: %f", got)
+	}
+}
+
 // The playback scheduler arms a prepared repeat before it reaches the decoder and keeps the outgoing speed at unity.
 func TestAutomixSchedulesPreparedLoop(t *testing.T) {
 	_, p := posted()

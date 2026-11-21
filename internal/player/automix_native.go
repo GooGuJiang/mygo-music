@@ -15,11 +15,50 @@ type automixNativeCut struct {
 	outBeat, inBeat                      time.Duration // the outgoing and incoming takeover positions
 	lead, tail                           time.Duration
 	oldVoiceEnd, newVoiceStart, bassFade time.Duration
+	lowpass                              automixLowpassTail
 }
 
 type automixNativeMix struct {
 	cut     automixNativeCut
 	out, in *automixLoopAudio
+}
+
+type automixLowpassTail struct {
+	at, bassEnd time.Duration
+	bassGain    float32
+}
+
+func planAutomixLowpass(in *beatTimeline, cue, pivot, tail time.Duration, old, carry automixStem) automixLowpassTail {
+	filter := automixLowpassTail{at: pivot}
+	reference := .65 * old.power[demucsBass]
+	available := carry.power[demucsBass]
+	if reference < .0002 || available < .00015 {
+		return filter
+	}
+	low := func(at time.Duration) float64 {
+		stem := in.stemAt(at)
+		power := stem.power[demucsBass] + .12*stem.power[demucsDrums]
+		i := int((at - in.start) / automixFeatureStep)
+		if at >= in.start && i < len(in.energy) {
+			power = max(power, .7*in.energy[i].low)
+		}
+		return power
+	}
+	// Ignore the first transient when estimating whether the new bass can sustain the handoff.
+	entry := (low(cue+automixFeatureStep) + low(cue+2*automixFeatureStep) + low(cue+3*automixFeatureStep)) / 3
+	if entry >= reference {
+		return filter
+	}
+	limit := min(250*time.Millisecond, tail-80*time.Millisecond)
+	for offset := 100 * time.Millisecond; offset < limit; offset += automixFeatureStep {
+		if low(cue+offset) >= reference {
+			limit = offset
+			break
+		}
+	}
+	filter.bassEnd = pivot + limit
+	filter.bassGain = float32(min(.78, math.Sqrt((reference-entry)/available)))
+	return filter
 }
 
 func planAutomixNative(out, in *beatTimeline, end time.Duration) automixNativeCut {
@@ -55,7 +94,7 @@ func planAutomixNative(out, in *beatTimeline, end time.Duration) automixNativeCu
 			if !ok || !pickupOK || preview.power[demucsOther] < .00015 {
 				continue
 			}
-			consider := func(loop automixLoopCut, source, pivot time.Duration, phrase, cost float64) {
+			consider := func(loop automixLoopCut, source, pivot, period time.Duration, phrase, cost float64) {
 				if left := end - pivot - tail; left < 100*time.Millisecond || left > automixOverlap {
 					return
 				}
@@ -90,7 +129,11 @@ func planAutomixNative(out, in *beatTimeline, end time.Duration) automixNativeCu
 					.60*clash - .36*carryClash - .21*jump - .09*bassJump - cost
 				if score > bestScore {
 					bassFade := time.Duration(float64(180*time.Millisecond) / (1 + entry.power[demucsBass]/(old.power[demucsBass]+.001)))
-					best = automixNativeCut{loop, pivot, cue, lead, tail, lastVoice, voice, max(55*time.Millisecond, bassFade)}
+					best = automixNativeCut{loop: loop, outBeat: pivot, inBeat: cue, lead: lead, tail: tail,
+						oldVoiceEnd: lastVoice, newVoiceStart: voice, bassFade: max(55*time.Millisecond, bassFade)}
+					if lead <= 750*time.Millisecond || !automixLoopCanStretch(period, beat) {
+						best.lowpass = planAutomixLowpass(in, cue, pivot, tail, old, carry)
+					}
 					bestScore = score
 				}
 			}
@@ -109,7 +152,7 @@ func planAutomixNative(out, in *beatTimeline, end time.Duration) automixNativeCu
 						// A finished vocal line can make room even if its drum groove is still playing.
 						cost = .18
 					}
-					consider(automixLoopCut{}, pivot, pivot, oldPhrases[i], cost)
+					consider(automixLoopCut{}, pivot, pivot, period, oldPhrases[i], cost)
 				}
 			}
 			for _, loop := range loops {
@@ -117,7 +160,7 @@ func planAutomixNative(out, in *beatTimeline, end time.Duration) automixNativeCu
 				after, afterOK := automixLoopFeatures(out, loop.start-automixLoopSeam, loop.start+loop.beat)
 				drumJump := math.Abs(math.Log((before.power[demucsDrums] + .00015) / (after.power[demucsDrums] + .00015)))
 				if beforeOK && afterOK && after.power[demucsDrums] >= .00015 && drumJump <= 1.6 {
-					consider(loop, loop.end, loop.target(), 0, .13+.13*drumJump+.13*backingClash(before, after, 0))
+					consider(loop, loop.end, loop.target(), loop.beat, 0, .13+.13*drumJump+.13*backingClash(before, after, 0))
 				}
 			}
 		}
@@ -160,7 +203,7 @@ func renderAutomixNative(c automixNativeCut, old, next automixStemSource) *autom
 	backingGain := func(elapsed time.Duration) float32 {
 		return .40*nativeRamp(elapsed, -c.lead, -c.lead/4) + .60*nativeRamp(elapsed, -c.lead/4, c.tail-35*time.Millisecond)
 	}
-	out := old.render(outStart, c.outBeat+c.tail, c.loop, false, func(at time.Duration) [demucsStemCount]float32 {
+	out := old.render(outStart, c.outBeat+c.tail, c.loop, false, c.lowpass, func(at time.Duration) [demucsStemCount]float32 {
 		voiceEnd := c.outBeat - 15*time.Millisecond
 		if c.loop.bars != 0 {
 			voiceEnd = c.loop.end - automixLoopSeam
@@ -175,7 +218,7 @@ func renderAutomixNative(c automixNativeCut, old, next automixStemSource) *autom
 	if out == nil {
 		return nil
 	}
-	in := next.render(inStart, c.inBeat+c.tail, automixLoopCut{}, true, func(at time.Duration) [demucsStemCount]float32 {
+	in := next.render(inStart, c.inBeat+c.tail, automixLoopCut{}, true, automixLowpassTail{}, func(at time.Duration) [demucsStemCount]float32 {
 		return [demucsStemCount]float32{
 			nativeRamp(at, c.newVoiceStart-20*time.Millisecond, c.newVoiceStart+15*time.Millisecond),
 			nativeRamp(at, c.inBeat-4*time.Millisecond, c.inBeat+12*time.Millisecond),

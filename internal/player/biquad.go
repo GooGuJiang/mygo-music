@@ -19,6 +19,13 @@ func (b *stereoBiquad) peak(rate int, hz, q, db float64) {
 	b.set(1+alpha*a, -2*cosine, 1-alpha*a, 1+alpha/a, -2*cosine, 1-alpha/a)
 }
 
+func (b *stereoBiquad) lowpass(rate int, hz float64) {
+	sine, cosine := math.Sincos(2 * math.Pi * hz / float64(rate))
+	alpha := sine / math.Sqrt2
+	n := 1 - cosine
+	b.set(n/2, n, n/2, 1+alpha, -2*cosine, 1-alpha)
+}
+
 func (b *stereoBiquad) shelf(rate int, hz, q, db float64, high bool) {
 	sine, cosine := math.Sincos(2 * math.Pi * hz / float64(rate))
 	a := math.Pow(10, db/40)

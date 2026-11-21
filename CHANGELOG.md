@@ -2,6 +2,14 @@
 
 All notable changes to MyGo Music are written down here. Versions follow [Semantic Versioning](https://semver.org).
 
+## [0.1.31] - 2026-11-21
+
+### Fixed
+
+- If the first fresh download after a failed preload also fails, playback refreshes the source twice more before reporting that the track cannot be played.
+
+[0.1.31]: https://github.com/GooGuJiang/mygo-music/compare/v0.1.30...v0.1.31
+
 ## [0.1.30] - 2026-11-21
 
 ### Fixed

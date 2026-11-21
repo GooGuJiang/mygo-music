@@ -226,6 +226,8 @@ func (p *Player) automixReady(quality string) bool {
 type ahead struct {
 	source, id, quality string
 	done                chan struct{} // closed once info, dl and err are in
+	promote             chan struct{} // play now, without waiting for the previous transfer
+	cancel              context.CancelFunc
 	info                *music.Stream
 	dl                  *download // nil for a song on disk, which opens at once
 	err                 error
@@ -303,16 +305,39 @@ func (p *Player) getAhead(quality string) {
 	if src == nil || src.Info().Playback == music.PlaybackRemote {
 		return
 	}
-	a := &ahead{source: t.Source, id: t.ID, quality: quality, done: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	a := &ahead{source: t.Source, id: t.ID, quality: quality, done: make(chan struct{}), promote: make(chan struct{}), cancel: cancel}
 	p.ahead = a
+	var current *download
+	if p.watch != nil {
+		current = p.watch.download
+	}
+	cache := p.Cache
 	go func() {
+		defer cancel()
 		defer close(a.done)
-		if dl, info, ok := p.Cache.lookup(t.Source, t.ID, quality); ok {
+		if dl, info, ok := cache.lookup(t.Source, t.ID, quality); ok {
 			a.dl, a.info = dl, info
 			return
 		}
+		// On a slow connection the track already playing gets the bandwidth.
+		if current != nil && current.finished != nil {
+			select {
+			case <-current.finished:
+			case <-a.promote:
+			case <-ctx.Done():
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			a.err = err
+			return
+		}
 		info, err := src.Stream(t.ID, quality)
-		if err == nil && info == nil {
+		if canceled := ctx.Err(); canceled != nil {
+			a.err = canceled
+			return
+		}
+		if err == nil && (info == nil || info.URL == "") {
 			err = music.ErrUnavailable
 		}
 		if err != nil {
@@ -321,7 +346,7 @@ func (p *Player) getAhead(quality string) {
 		}
 		a.info = info
 		if _, isFile := music.PathOf(info.URL); !isFile {
-			a.dl = p.Cache.download(t.Source, t.ID, quality, info)
+			a.dl = cache.download(t.Source, t.ID, quality, info)
 		}
 	}()
 }
@@ -334,6 +359,9 @@ func (p *Player) takeAhead(t music.Track, quality string) *ahead {
 		return nil
 	}
 	p.ahead = nil
+	if a.promote != nil {
+		close(a.promote)
+	}
 	return a
 }
 
@@ -345,13 +373,18 @@ func (p *Player) dropAhead() {
 	if a == nil {
 		return
 	}
-	go a.close()
+	a.close()
 }
 
 // close stops what was asked for ahead once it's in, if it's still coming in.
 func (a *ahead) close() {
-	<-a.done
-	if a.dl != nil {
-		a.dl.Close()
+	if a.cancel != nil {
+		a.cancel()
 	}
+	go func() {
+		<-a.done
+		if a.dl != nil {
+			a.dl.Close()
+		}
+	}()
 }

@@ -1,15 +1,18 @@
 package player
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"math/cmplx"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,15 +30,16 @@ import (
 // app's memory, as much again as the song. Songs the cache would not keep
 // come into memory.
 type download struct {
-	mu     sync.Mutex
-	cond   sync.Cond
-	file   *os.File // where the song is, or nil: then data
-	data   []byte
-	n      int64 // the bytes in so far
-	size   int64 // expected, or 0 if unknown
-	done   bool
-	err    error
-	cancel context.CancelFunc
+	mu       sync.Mutex
+	cond     sync.Cond
+	file     *os.File // where the song is, or nil: then data
+	data     []byte
+	n        int64 // the bytes in so far
+	size     int64 // expected, or 0 if unknown
+	done     bool
+	err      error
+	cancel   context.CancelFunc
+	finished chan struct{} // closed when the network transfer stops
 	// part is the file's path until the cache keeps it, which keep does
 	// once the song has all come in: the path it is at then.
 	part    string
@@ -55,7 +59,7 @@ type download struct {
 // without one.
 func startDownload(url string, size int64, headers map[string]string, part *os.File, keep func(string, int64) (string, bool)) *download {
 	ctx, cancel := context.WithCancel(context.Background())
-	d := &download{size: size, cancel: cancel, users: 2}
+	d := &download{size: size, cancel: cancel, finished: make(chan struct{}), users: 2}
 	d.cond.L = &d.mu
 	switch {
 	case part != nil:
@@ -63,7 +67,7 @@ func startDownload(url string, size int64, headers map[string]string, part *os.F
 	case size > 0:
 		d.data = make([]byte, 0, prealloc(size))
 	}
-	go d.run(ctx, url, headers)
+	go d.run(ctx, url, headers, 8*time.Second)
 	return d
 }
 
@@ -89,52 +93,126 @@ func opened(f *os.File, size int64) *download {
 	return d
 }
 
-func (d *download) run(ctx context.Context, url string, headers map[string]string) {
+var errAudioTransfer = errors.New("audio transfer failed")
+
+func (d *download) run(ctx context.Context, url string, headers map[string]string, idle time.Duration) {
 	defer d.release()
-	finish := func(err error) {
-		d.mu.Lock()
+	defer close(d.finished)
+	req, err := http.NewRequest("GET", url, nil)
+	if err == nil {
+		req.Header.Set("User-Agent", music.Agent)
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		// Start with the whole stream, regardless of a plugin's other headers.
+		req.Header.Del("Range")
+		req.Header.Del("If-Range")
+		client := music.HeadersStay(http.DefaultClient, req.URL.Hostname(), headers)
+		var length int64 = -1
+		var etag string
+		var retry bool
+		retry, err = d.fetch(ctx, client, req, idle, &length, &etag)
+		if retry && ctx.Err() == nil {
+			select {
+			case <-ctx.Done():
+				err = ctx.Err()
+			case <-time.After(250 * time.Millisecond):
+				_, err = d.fetch(ctx, client, req, idle, &length, &etag)
+			}
+		}
+	}
+	if err == nil && d.part != "" && (d.size <= 0 || d.n == d.size) {
+		err = d.hand()
+	}
+	if err != nil && ctx.Err() == nil {
+		err = fmt.Errorf("%w: %w", errAudioTransfer, err)
+	}
+	d.mu.Lock()
+	if !d.done {
 		d.done, d.err = true, err
-		d.cond.Broadcast()
-		d.mu.Unlock()
 	}
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	d.cond.Broadcast()
+	d.mu.Unlock()
+}
+
+func (d *download) fetch(ctx context.Context, client *http.Client, request *http.Request, idle time.Duration, length *int64, etag *string) (bool, error) {
+	req := request.Clone(ctx)
+	offset := d.n
+	if offset > 0 && offset < *length && *etag != "" {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
+		req.Header.Set("If-Range", *etag)
+		req.Header.Set("Accept-Encoding", "identity")
+	}
+	res, err := music.DoWithIdleTimeout(client, req, idle)
 	if err != nil {
-		finish(err)
-		return
-	}
-	req.Header.Set("User-Agent", music.Agent)
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	res, err := music.HeadersStay(http.DefaultClient, req.URL.Hostname(), headers).Do(req)
-	if err != nil {
-		finish(err)
-		return
+		return true, err
 	}
 	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		finish(errors.New(res.Status))
-		return
+	var replay int64
+	switch res.StatusCode {
+	case http.StatusOK:
+		if offset > 0 && *length >= 0 && res.ContentLength >= 0 && *length != res.ContentLength {
+			return false, errors.New("audio changed while downloading")
+		}
+		replay = offset
+		if res.ContentLength >= 0 {
+			*length = res.ContentLength
+			d.mu.Lock()
+			d.size = *length
+			d.mu.Unlock()
+		}
+		if tag := res.Header.Get("ETag"); strings.HasPrefix(tag, "\"") && strings.HasSuffix(tag, "\"") {
+			*etag = tag
+		}
+	case http.StatusPartialContent:
+		want := fmt.Sprintf("bytes %d-%d/%d", offset, *length-1, *length)
+		if req.Header.Get("Range") == "" || res.Header.Get("Content-Range") != want ||
+			res.ContentLength >= 0 && res.ContentLength != *length-offset ||
+			res.Header.Get("ETag") != "" && res.Header.Get("ETag") != *etag {
+			return false, errors.New("invalid resumed audio response")
+		}
+	case http.StatusRequestTimeout, http.StatusInternalServerError, http.StatusBadGateway,
+		http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true, errors.New(res.Status)
+	default:
+		return false, errors.New(res.Status)
+	}
+	if encoding := res.Header.Get("Content-Encoding"); encoding != "" && !strings.EqualFold(encoding, "identity") {
+		return false, errors.New("unsupported audio response encoding")
 	}
 	buf := make([]byte, 64<<10)
 	for {
 		n, err := res.Body.Read(buf)
-		if n > 0 {
-			d.write(buf[:n])
+		start := 0
+		if replay > 0 && n > 0 {
+			start = int(min(int64(n), replay))
+			if !bytes.Equal(buf[:start], d.peek(offset-replay, start)) {
+				return false, errors.New("audio changed while downloading")
+			}
+			replay -= int64(start)
+		}
+		if n > start {
+			if *length >= 0 && int64(n-start) > *length-d.n {
+				return false, errors.New("audio exceeded its response length")
+			}
+			d.write(buf[start:n])
 		}
 		if err == io.EOF {
-			// Whole if as long as promised: the cache's.
-			if d.part != "" && (d.size <= 0 || d.n == d.size) {
-				d.hand()
+			if replay > 0 || *length >= 0 && d.n != *length {
+				return true, io.ErrUnexpectedEOF
 			}
-			finish(nil)
-			return
+			return false, nil
 		}
 		if err != nil {
-			finish(err)
-			return
+			return true, err
 		}
 	}
+}
+
+func (d *download) failure() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.err
 }
 
 // write adds b to what is in. Only run writes, so it reads the file and
@@ -171,20 +249,21 @@ func (d *download) toMemory() {
 // hand gives the song, all in, to the cache, and reads it from where it
 // is kept. Windows moves no file that is open: it closes the file first,
 // and opens it again where it went, while no one reads it.
-func (d *download) hand() {
+func (d *download) hand() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.file.Close()
 	path, ok := d.keep(d.part, d.n)
 	f, err := os.Open(path)
 	if err != nil {
-		d.file, d.n, d.done, d.err = nil, 0, true, err
-		return
+		d.file, d.n = nil, 0
+		return err
 	}
 	d.file = f
 	if ok {
 		d.part = ""
 	}
+	return nil
 }
 
 // Close stops the download and wakes its readers: the stream lets the

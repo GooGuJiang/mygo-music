@@ -4,8 +4,30 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync/atomic"
 	"testing"
 )
+
+// A cover whose connection drops mid-body is fetched again with its original headers.
+func TestFetchRecoversFromShortCover(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Image") != "fixture" {
+			t.Error("request lost its source header")
+		}
+		w.Header().Set("Content-Length", "5")
+		if requests.Add(1) == 1 {
+			w.Write([]byte("co"))
+			return
+		}
+		w.Write([]byte("cover"))
+	}))
+	defer srv.Close()
+	useImageHeaders(t, func(*url.URL) map[string]string { return map[string]string{"X-Image": "fixture"} })
+	if b, err := Fetch(srv.URL); err != nil || string(b) != "cover" || requests.Load() != 2 {
+		t.Fatalf("got %q, %v, from %d requests", b, err, requests.Load())
+	}
+}
 
 // useImageHeaders sets ImageHeaders for a test, putting back what was there.
 func useImageHeaders(t *testing.T, f func(*url.URL) map[string]string) {

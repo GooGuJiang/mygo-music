@@ -77,6 +77,7 @@ type Player struct {
 	track             *music.Track
 	out               *audio.Player
 	handoff           *audio.Player
+	handoffDownload   *download
 	automixPrep       *automixPreparation
 	automixMix        *automixPlan
 	nextRhythm        *nextRhythm
@@ -94,6 +95,7 @@ type Player struct {
 	err               string
 	gen               int // counts loads, to drop the results of stale ones
 	cancelOpen        context.CancelFunc
+	cancelCover       context.CancelFunc
 
 	lyrics       []lyrics.Line
 	lyricsLoaded bool
@@ -695,15 +697,24 @@ func (p *Player) stop() {
 	p.cancelAutomixPrep()
 	p.clearNextRhythm()
 	p.finishHandoff(p.handoff)
+	p.dropAhead()
 	if p.cancelOpen != nil {
 		p.cancelOpen()
 		p.cancelOpen = nil
+	}
+	if p.cancelCover != nil {
+		p.cancelCover()
+		p.cancelCover = nil
 	}
 	if s, ok := p.stream.(*demucsStream); ok {
 		s.cancel()
 	}
 	if out := p.out; out != nil {
-		retireOutput(out)
+		var dl *download
+		if p.watch != nil {
+			dl = p.watch.download
+		}
+		retireOutput(out, dl)
 	}
 	p.out, p.stream, p.watch, p.info, p.remote = nil, nil, nil, nil, nil
 	p.dolby = DolbyProcessing{}
@@ -712,10 +723,16 @@ func (p *Player) stop() {
 	p.fade.attach(nil, 1)
 }
 
-func retireOutput(out *audio.Player) {
+func retireOutput(out *audio.Player, dl *download) {
 	// Pausing uses the mixer ramp before Close removes the voice.
 	out.Pause()
-	time.AfterFunc(100*time.Millisecond, out.Close)
+	time.AfterFunc(100*time.Millisecond, func() {
+		out.Close()
+		if dl != nil {
+			// The decoder can be blocked waiting for the very transfer it owns.
+			dl.cancel()
+		}
+	})
 }
 
 func (p *Player) finishHandoff(out *audio.Player) {
@@ -726,7 +743,8 @@ func (p *Player) finishHandoff(out *audio.Player) {
 		if p.watch != nil {
 			p.watch.setAutomix(nil, true)
 		}
-		retireOutput(out)
+		retireOutput(out, p.handoffDownload)
+		p.handoffDownload = nil
 	}
 }
 
@@ -794,6 +812,7 @@ func (p *Player) loadTrack(at, skipped, dir int, play bool, from, overlap time.D
 	}
 	var outgoing *audio.Player
 	var outgoingWatch *watched
+	var outgoingDownload *download
 	if _, demucs := p.stream.(*demucsStream); (mix != nil || demucs && from == 0) && play && p.playing && !p.seeking &&
 		p.out != nil && p.out.Playing() && src != nil && src.Info().Playback != music.PlaybackRemote {
 		outgoing, p.out = p.out, nil
@@ -801,11 +820,16 @@ func (p *Player) loadTrack(at, skipped, dir int, play bool, from, overlap time.D
 		if p.watch != nil {
 			p.watch.clickGain.Store(0)
 		}
+		if outgoingWatch != nil {
+			outgoingDownload = outgoingWatch.download
+		}
 		p.stream = nil // the outgoing audio player owns its decoder until the handoff ends
 	}
+	quality := p.playbackQuality()
+	pre := p.takeAhead(t, quality)
 	p.stop()
 	if outgoing != nil {
-		p.handoff = outgoing
+		p.handoff, p.handoffDownload = outgoing, outgoingDownload
 		if mix != nil && !mix.timed() {
 			mix = &automixPlan{target: mix.target, overlap: overlap}
 		}
@@ -834,11 +858,12 @@ func (p *Player) loadTrack(at, skipped, dir int, play bool, from, overlap time.D
 	p.loadCover(gen, &t)
 	p.loadLyrics(gen, src, t)
 	if src != nil && src.Info().Playback == music.PlaybackRemote {
+		if pre != nil {
+			pre.close()
+		}
 		p.loadRemote(gen, src, at, skipped, dir, play, from)
 		return
 	}
-	quality := p.playbackQuality()
-	pre := p.takeAhead(t, quality)
 	var engine *demucsEngine
 	if t.ShowID == "" {
 		p.PrepareDemucs()
@@ -903,7 +928,8 @@ func (p *Player) loadTrack(at, skipped, dir int, play bool, from, overlap time.D
 				}
 				decoded = d
 			}
-			p.watch = &watched{stream: decoded, now: p.now, ended: func() { p.post(func() {}) }}
+			dl, _ := s.source()
+			p.watch = &watched{stream: decoded, download: dl, now: p.now, ended: func() { p.post(func() {}) }}
 			p.watch.rhythm, _ = s.(*demucsStream)
 			p.applyMetronome()
 			waitForFirstRead := outgoing != nil && p.handoff == outgoing
@@ -989,11 +1015,20 @@ func (p *Player) loadTrack(at, skipped, dir int, play bool, from, overlap time.D
 			}
 			p.fade.attach(p.out, level)
 			p.applyGain()
+			out := p.out
 			p.out.OnEnd(func() {
 				p.post(func() {
-					if gen == p.gen {
-						p.ended()
+					if gen != p.gen || p.out != out {
+						return
 					}
+					if dl != nil {
+						if err := dl.failure(); err != nil {
+							p.stop()
+							p.loadFailed(t.Source, err, at, skipped, stay)
+							return
+						}
+					}
+					p.ended()
 				})
 			})
 			if p.pending > 0 {
@@ -1025,9 +1060,12 @@ func (p *Player) loadCover(gen int, t *music.Track) {
 	if url == "" {
 		return
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	p.cancelCover = cancel
 	go func() {
+		defer cancel()
 		// The system shows it small, as Now Playing does.
-		cover, err := music.Fetch(music.SizedImage(url, 600))
+		cover, err := music.FetchContext(ctx, music.SizedImage(url, 600))
 		if err == nil {
 			p.post(func() {
 				if gen == p.gen {
@@ -1088,6 +1126,8 @@ func errorText(err error) string {
 		return i18n.T("Install the MyGo native codec to play Dolby audio")
 	case errors.Is(err, errCodecFailed):
 		return i18n.T("Couldn't decode this audio")
+	case errors.Is(err, errAudioTransfer):
+		return i18n.T("The download failed. Check your network and try again.")
 	case errors.Is(err, music.ErrUnavailable):
 		return i18n.T("This song isn't available")
 	case errors.Is(err, music.ErrSignIn):
@@ -1108,6 +1148,12 @@ var errNoSource = errors.New("player: no such source")
 // there, or else streamed into the cache, and kept once it has all come in.
 // What failed ahead is asked for again: it may have been a moment's.
 func (p *Player) open(ctx context.Context, src music.Source, t music.Track, quality string, pre *ahead) (*music.Stream, stream, error) {
+	if err := ctx.Err(); err != nil {
+		if pre != nil {
+			pre.close()
+		}
+		return nil, nil, err
+	}
 	if src == nil {
 		if pre != nil {
 			pre.close()
@@ -1118,7 +1164,12 @@ func (p *Player) open(ctx context.Context, src music.Source, t music.Track, qual
 	var info *music.Stream
 	ok := false
 	if pre != nil {
-		<-pre.done
+		select {
+		case <-pre.done:
+		case <-ctx.Done():
+			pre.close()
+			return nil, nil, ctx.Err()
+		}
 		if pre.err == nil {
 			info, dl, ok = pre.info, pre.dl, true
 			if dl == nil {
@@ -1127,9 +1178,13 @@ func (p *Player) open(ctx context.Context, src music.Source, t music.Track, qual
 				if dl, err = openFile(path); err != nil {
 					return nil, nil, err
 				}
+			} else if dl.failure() != nil {
+				dl.Close()
+				ok = false
 			}
 		}
 	}
+	usingAhead := ok
 	if !ok {
 		dl, info, ok = p.Cache.lookup(t.Source, t.ID, quality)
 	}
@@ -1139,7 +1194,10 @@ func (p *Player) open(ctx context.Context, src music.Source, t music.Track, qual
 		if err != nil {
 			return nil, nil, err
 		}
-		if info == nil {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		if info == nil || info.URL == "" {
 			return nil, nil, music.ErrUnavailable
 		}
 		if path, isFile := music.PathOf(info.URL); isFile {
@@ -1160,7 +1218,14 @@ func (p *Player) open(ctx context.Context, src music.Source, t music.Track, qual
 		return nil, nil, ctx.Err()
 	}
 	if err != nil {
+		transferErr := dl.failure()
 		dl.Close()
+		if transferErr != nil {
+			if usingAhead && ctx.Err() == nil {
+				return p.open(ctx, src, t, quality, nil)
+			}
+			return nil, nil, transferErr
+		}
 		return nil, nil, err
 	}
 	return info, s, nil

@@ -48,7 +48,7 @@ func (p *Player) FindSong(src music.Source, t music.Track, quality string) (*Son
 }
 
 // songTypes are the types of song the app knows, which name their files.
-var songTypes = []string{"mp3", "flac", "ogg", "wav", "m4a", "aac", "ac3", "eac3", "ec3", "thd", "truehd"}
+var songTypes = []string{"mp3", "flac", "ogg", "wav", "m4a", "mp4", "aac", "ac3", "eac3", "ec3", "thd", "truehd"}
 
 // songType is the type a stream says it is, to name its file by: one the app
 // knows, or else mp3, as the cache takes it. What a source sent may hold

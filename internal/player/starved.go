@@ -16,7 +16,8 @@ const starvedAfter = 250 * time.Millisecond
 // watched is the stream that plays, timing what it's asked.
 type watched struct {
 	stream
-	now func() time.Time
+	now      func() time.Time
+	download *download
 	// ended hears that a call that took starvedAfter or longer returned,
 	// for what said it's buffering to say so no more.
 	ended      func()

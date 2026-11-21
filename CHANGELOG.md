@@ -2,6 +2,14 @@
 
 All notable changes to MyGo Music are written down here. Versions follow [Semantic Versioning](https://semver.org).
 
+## [0.1.27] - 2026-11-21
+
+### Fixed
+
+- Fast Automix handoffs carry a short low-pass tail from the outgoing bass while the incoming accompaniment enters. The tail releases when the new low end arrives, reducing bass loss and masking abrupt speed changes.
+
+[0.1.27]: https://github.com/GooGuJiang/mygo-music/compare/v0.1.26...v0.1.27
+
 ## [0.1.26] - 2026-11-21
 
 ### Added
@@ -264,7 +272,7 @@ All notable changes to MyGo Music are written down here. Versions follow [Semant
 
 The first release: a native music player that plays your local files and gets everything else from plugins.
 
-[0.1.26]: https://github.com/GooGuJiang/mygo-music/compare/298c88a...v0.1.26
+[0.1.26]: https://github.com/GooGuJiang/mygo-music/compare/v0.1.25...v0.1.26
 [0.1.25]: https://github.com/egoist/mygo-music/compare/v0.1.24...v0.1.25
 [0.1.24]: https://github.com/egoist/mygo-music/compare/v0.1.23...v0.1.24
 [0.1.23]: https://github.com/egoist/mygo-music/compare/v0.1.22...v0.1.23

@@ -2,6 +2,14 @@
 
 All notable changes to MyGo Music are written down here. Versions follow [Semantic Versioning](https://semver.org).
 
+## [0.1.33] - 2026-11-25
+
+### Fixed
+
+- On Windows, HTTP requests and plugin child processes (such as `ffmpeg`) now fall back to the Windows system proxy settings when `HTTP_PROXY` / `HTTPS_PROXY` environment variables are not set, while bypassing loopback and configured override hosts.
+
+[0.1.33]: https://github.com/GooGuJiang/mygo-music/compare/v0.1.32...v0.1.33
+
 ## [0.1.32] - 2026-11-21
 
 ### Fixed

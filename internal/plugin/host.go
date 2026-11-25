@@ -27,6 +27,7 @@ import (
 
 	"mygo-music/internal/i18n"
 	"mygo-music/internal/music"
+	"mygo-music/internal/sysproxy"
 )
 
 // openURL opens a page in the listener's browser. The app sets it.
@@ -357,6 +358,7 @@ func (p *Plugin) spawn(v *vm) native {
 		}
 		cmd := exec.Command(command, cmdArgs...)
 		cmd.Dir = p.dir
+		cmd.Env = sysproxy.Env(nil)
 		hideConsole(cmd)
 		stderr := &tailWriter{to: logWriter{p.manifest.ID}}
 		cmd.Stderr = stderr

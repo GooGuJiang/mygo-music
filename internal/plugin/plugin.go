@@ -40,7 +40,10 @@ import (
 
 	"mygo-music/internal/i18n"
 	"mygo-music/internal/music"
+	"mygo-music/internal/sysproxy"
 )
+
+var pluginTransport = sysproxy.NewTransport()
 
 const (
 	callTimeout = 30 * time.Second
@@ -494,7 +497,7 @@ func (p *Plugin) webOptions() webapi.Options {
 	if len(hosts) == 0 {
 		return webapi.Options{}
 	}
-	opts := webapi.Options{Client: &http.Client{Timeout: 10 * time.Minute}}
+	opts := webapi.Options{Client: &http.Client{Timeout: 10 * time.Minute, Transport: pluginTransport}}
 	for _, h := range hosts {
 		if h == "*" {
 			return opts

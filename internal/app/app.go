@@ -18,6 +18,7 @@ import (
 	"mygo-music/internal/music"
 	"mygo-music/internal/player"
 	"mygo-music/internal/plugin"
+	"mygo-music/internal/sysproxy"
 )
 
 type pageKind int
@@ -331,6 +332,7 @@ func (a *app) closeSources() {
 
 // Run runs the app until it quits.
 func Run() error {
+	sysproxy.Install()
 	// Opening the app again shows the running one's window: Linux and
 	// Windows would start another, with a second tray icon. Asked before
 	// anything else, so the second one touches no data on its way out.

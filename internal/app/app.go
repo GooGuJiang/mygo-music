@@ -89,6 +89,7 @@ type app struct {
 	// signInPages are the windows of plugins' sign-in pages showing, by
 	// plugin. Main thread only.
 	signInPages map[string]*mygo.Window
+	webFetch    *webFetchHost
 	// signInOver is the window the sign-in dialog is in, for a sign-in page
 	// to open over: the settings window's, if asked there. Set on the main
 	// thread, read on the plugin's.
@@ -245,6 +246,8 @@ func (a *app) makeSources() {
 	plugin.SetOpenURL(mygo.Shell.OpenExternal)
 	plugin.SetAppVersion(mygo.App.Version())
 	plugin.SetWebSignIn(a.webSignIn)
+	a.webFetch = newWebFetchHost(a)
+	plugin.SetWebFetch(a.webFetch.do)
 	a.plugins = plugin.Discover(pluginsDir(), userDataDir("plugin-data"))
 	a.headers = &headerPlugins{}
 	music.ImageHeaders = a.headers.image
@@ -325,6 +328,9 @@ func (a *app) sourceByID(id string) music.Source {
 
 // closeSources stops the plugins, which end with the app.
 func (a *app) closeSources() {
+	if a.webFetch != nil {
+		a.webFetch.closeAll()
+	}
 	for _, p := range a.plugins {
 		p.Close()
 	}

@@ -370,6 +370,8 @@ var zhCN = map[string]string{
 	"You'll finish signing in with the plugin, on a page it opens.": "你将在插件打开的页面中完成登录。",
 	"Continue in the window that opened.":                           "请在打开的窗口中继续。",
 	"This computer can't show the page to sign in on":               "这台电脑无法显示登录页面",
+	"This computer can't show the verification page":                "这台电脑无法显示验证页面",
+	"Verify %s":                                                     "验证 %s",
 	"The sign-in window was closed before you finished signing in":  "登录窗口在完成登录前被关闭了",
 	"Signing in took too long. Try again.":                          "登录用时过长，请重试。",
 	"Zoom":                                                          "缩放",

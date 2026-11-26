@@ -151,51 +151,51 @@ func (p *Plugin) IsLiked(ids []string) (map[string]bool, error) {
 }
 
 func (p *Plugin) Like(id string, on bool) error {
-	return p.call("like", map[string]any{"id": id, "on": on}, nil)
+	return p.callWithin(signInTimeout, "like", map[string]any{"id": id, "on": on}, nil)
 }
 
 func (p *Plugin) LikeEpisode(id string, on bool) error {
-	return p.call("likeEpisode", map[string]any{"id": id, "on": on}, nil)
+	return p.callWithin(signInTimeout, "likeEpisode", map[string]any{"id": id, "on": on}, nil)
 }
 
 func (p *Plugin) CreatePlaylist(name string) (*music.Playlist, error) {
 	var pl music.Playlist
-	if err := p.call("createPlaylist", map[string]string{"name": name}, &pl); err != nil {
+	if err := p.callWithin(signInTimeout, "createPlaylist", map[string]string{"name": name}, &pl); err != nil {
 		return nil, err
 	}
 	return &pl, nil
 }
 
 func (p *Plugin) RenamePlaylist(id, name string) error {
-	return p.call("renamePlaylist", map[string]string{"id": id, "name": name}, nil)
+	return p.callWithin(signInTimeout, "renamePlaylist", map[string]string{"id": id, "name": name}, nil)
 }
 
 func (p *Plugin) DeletePlaylist(id string) error {
-	return p.call("deletePlaylist", map[string]string{"id": id}, nil)
+	return p.callWithin(signInTimeout, "deletePlaylist", map[string]string{"id": id}, nil)
 }
 
 func (p *Plugin) AddToPlaylist(id string, trackIDs []string) error {
-	return p.call("addToPlaylist", map[string]any{"id": id, "trackIds": trackIDs}, nil)
+	return p.callWithin(signInTimeout, "addToPlaylist", map[string]any{"id": id, "trackIds": trackIDs}, nil)
 }
 
 func (p *Plugin) RemoveFromPlaylist(id string, trackIDs []string) error {
-	return p.call("removeFromPlaylist", map[string]any{"id": id, "trackIds": trackIDs}, nil)
+	return p.callWithin(signInTimeout, "removeFromPlaylist", map[string]any{"id": id, "trackIds": trackIDs}, nil)
 }
 
 func (p *Plugin) MovePlaylistTrack(id string, from, to int) error {
-	return p.call("movePlaylistTrack", map[string]any{"id": id, "from": from, "to": to}, nil)
+	return p.callWithin(signInTimeout, "movePlaylistTrack", map[string]any{"id": id, "from": from, "to": to}, nil)
 }
 
 func (p *Plugin) SavePlaylist(id string, on bool) error {
-	return p.call("savePlaylist", map[string]any{"id": id, "on": on}, nil)
+	return p.callWithin(signInTimeout, "savePlaylist", map[string]any{"id": id, "on": on}, nil)
 }
 
 func (p *Plugin) FollowArtist(id string, on bool) error {
-	return p.call("followArtist", map[string]any{"id": id, "on": on}, nil)
+	return p.callWithin(signInTimeout, "followArtist", map[string]any{"id": id, "on": on}, nil)
 }
 
 func (p *Plugin) SaveAlbum(id string, on bool) error {
-	return p.call("saveAlbum", map[string]any{"id": id, "on": on}, nil)
+	return p.callWithin(signInTimeout, "saveAlbum", map[string]any{"id": id, "on": on}, nil)
 }
 
 func (p *Plugin) SavedAlbums(offset int) (*music.AlbumList, error) {
@@ -224,7 +224,7 @@ func (p *Plugin) Show(id string, offset int) (*music.ShowPage, error) {
 }
 
 func (p *Plugin) SubscribeShow(id string, on bool) error {
-	return p.call("subscribeShow", map[string]any{"id": id, "on": on}, nil)
+	return p.callWithin(signInTimeout, "subscribeShow", map[string]any{"id": id, "on": on}, nil)
 }
 
 func (p *Plugin) Stations() ([]music.Station, error) {
@@ -258,7 +258,7 @@ func (p *Plugin) LikeComment(trackID, commentID string, on bool) error {
 
 func (p *Plugin) PostComment(trackID, text string) (*music.Comment, error) {
 	var cm music.Comment
-	if err := p.call("postComment", map[string]string{"trackId": trackID, "text": text}, &cm); err != nil {
+	if err := p.callWithin(signInTimeout, "postComment", map[string]string{"trackId": trackID, "text": text}, &cm); err != nil {
 		return nil, err
 	}
 	return &cm, nil

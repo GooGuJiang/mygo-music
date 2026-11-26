@@ -65,6 +65,34 @@ var webSignIn = func(WebSignIn) (string, error) { return "", errors.New("can't s
 // SetWebSignIn says how to show a sign-in page, and get its cookies.
 func SetWebSignIn(show func(WebSignIn) (string, error)) { webSignIn = show }
 
+// WebFetchRequest asks the app to execute an HTTP request inside a real
+// browser WebView page on Origin (sharing a persistent per-plugin session),
+// showing the window for the listener to complete verification if the site
+// responds with an interactive challenge.
+type WebFetchRequest struct {
+	Plugin    string            `json:"-"`
+	Name      string            `json:"-"`
+	Origin    string            `json:"origin"`
+	URL       string            `json:"url"`
+	Method    string            `json:"method,omitempty"`
+	Headers   map[string]string `json:"headers,omitempty"`
+	Body      string            `json:"body,omitempty"`
+	UserAgent string            `json:"userAgent,omitempty"`
+}
+
+// WebFetchResponse is the HTTP status and body returned by WebFetch.
+type WebFetchResponse struct {
+	Status int    `json:"status"`
+	Text   string `json:"text"`
+}
+
+var webFetch = func(WebFetchRequest) (WebFetchResponse, error) {
+	return WebFetchResponse{}, errors.New("can't run browser requests here")
+}
+
+// SetWebFetch wires the browser-backed fetch bridge used by host.webFetch.
+func SetWebFetch(fn func(WebFetchRequest) (WebFetchResponse, error)) { webFetch = fn }
+
 type native = func(*moejs.Realm, moejs.Value, []moejs.Value) (moejs.Value, error)
 
 // installHost gives the runtime the host global and console.
@@ -153,6 +181,7 @@ func (p *Plugin) installHost(v *vm) error {
 		}),
 		"waitForRedirect": moejs.NativeFunc(p.waitForRedirect(v)),
 		"webSignIn":       moejs.NativeFunc(p.webSignIn(v)),
+		"webFetch":        moejs.NativeFunc(p.webFetch(v)),
 		"spawn":           moejs.NativeFunc(p.spawn(v)),
 	})
 }
@@ -307,6 +336,56 @@ func (p *Plugin) checkWebSignIn(o WebSignIn) error {
 	}
 	if len(o.Until) == 0 {
 		return errors.New("webSignIn needs the names of the cookies that say it's done, as until")
+	}
+	return nil
+}
+
+// webFetch runs an HTTP request inside the app's real WebView on o.Origin,
+// enforcing the plugin's network permission on both Origin and URL.
+func (p *Plugin) webFetch(v *vm) native {
+	return func(_ *moejs.Realm, _ moejs.Value, args []moejs.Value) (moejs.Value, error) {
+		var o WebFetchRequest
+		if err := v.rt.ToGoInto(moejs.Arg(args, 0), &o); err != nil {
+			return moejs.Undefined(), err
+		}
+		if err := p.checkWebFetch(o); err != nil {
+			return moejs.Undefined(), err
+		}
+		o.Plugin, o.Name = p.manifest.ID, p.manifest.Name
+		if o.Method == "" {
+			o.Method = http.MethodGet
+		}
+		promise, settle := v.loop.NewPromise()
+		go func() {
+			res, err := webFetch(o)
+			settle(func(rt *moejs.Runtime) (moejs.Value, error) {
+				if err != nil {
+					return moejs.Undefined(), err
+				}
+				return rt.FromGo(map[string]any{
+					"status": res.Status,
+					"text":   res.Text,
+				})
+			})
+		}()
+		return promise, nil
+	}
+}
+
+func (p *Plugin) checkWebFetch(o WebFetchRequest) error {
+	network := p.manifest.Permissions.Network
+	if len(network) == 0 {
+		return errors.New("webFetch needs the network permission")
+	}
+	allow := webapi.AllowHosts(network...)
+	for _, raw := range []string{o.Origin, o.URL} {
+		u, err := url.Parse(raw)
+		if err != nil || u.Scheme != "https" || u.Host == "" {
+			return fmt.Errorf("not a secure web address for webFetch: %s", raw)
+		}
+		if err := allow(&http.Request{URL: u}); err != nil {
+			return fmt.Errorf("the plugin can't reach %s", u.Hostname())
+		}
 	}
 	return nil
 }

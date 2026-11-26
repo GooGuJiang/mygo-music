@@ -2,7 +2,11 @@
 
 All notable changes to MyGo Music are written down here. Versions follow [Semantic Versioning](https://semver.org).
 
-## [0.1.33] - 2026-11-25
+## [0.1.33] - 2026-11-27
+
+### Added
+
+- Plugins can now use `host.webFetch` to send requests through a real WebView session on the target origin, automatically displaying an interactive verification window when anti-bot challenges (such as SoundCloud DataDome) are returned and hiding it once completed.
 
 ### Fixed
 

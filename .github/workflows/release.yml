@@ -1,10 +1,7 @@
-# Pushing a tag such as v0.2.0 builds the apps of macOS, Windows and
-# Linux, signs them and their updates, and uploads them to a draft
-# release of the tag, which is published by hand: installed apps update
-# to it then. Running the workflow by hand, from the Actions tab or with
-# `gh workflow run release.yml`, does the same for the version in
-# mygo.config.ts of the branch it runs on, tagging that commit when the tag
-# isn't there yet, and building the tag when it is.
+# Pushing a tag such as v0.1.33 (matching mygo.config.ts) builds the Windows
+# x64 installer, transfers the unchanged Windows x64 CUDA runtime ZIP from the
+# previous release directly on GitHub Actions (avoiding slow local uploads),
+# and publishes the release once both assets are verified and uploaded.
 name: Release
 
 on:
@@ -13,25 +10,33 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write # the tag, the draft release, and the uploads to it
+  contents: write
 
 jobs:
   draft-release:
     runs-on: ubuntu-latest
     outputs:
-      tag: ${{ steps.tag.outputs.tag }}
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      commit: ${{ steps.meta.outputs.commit }}
+      prev_tag: ${{ steps.meta.outputs.prev_tag }}
+      prev_setup: ${{ steps.meta.outputs.prev_setup }}
+      prev_setup_sha: ${{ steps.meta.outputs.prev_setup_sha }}
+      prev_cuda_sha: ${{ steps.meta.outputs.prev_cuda_sha }}
     steps:
       - uses: actions/checkout@v7
-      # mygo.config.ts is code, which Bun runs.
+        with:
+          fetch-depth: 0
       - uses: oven-sh/setup-bun@v2
-      # mygo build uploads to the release of mygo.config.ts's version, so
-      # that's the tag. A tag pushed by the workflow's own token starts no
-      # other run.
-      - name: Find the tag
-        id: tag
+      - name: Resolve version, tag, and previous release assets
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          tag="v$(bun -e 'console.log((await import("./mygo.config.ts")).default({ command: "build" }).version)')"
-          if [ "$GITHUB_EVENT_NAME" = push ]; then
+          set -euo pipefail
+          version="$(bun -e 'console.log((await import("./mygo.config.ts")).default({ command: "build" }).version)')"
+          tag="v$version"
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
             if [ "$GITHUB_REF_NAME" != "$tag" ]; then
               echo "::error::$GITHUB_REF_NAME doesn't match the version of mygo.config.ts, $tag"
               exit 1
@@ -40,20 +45,43 @@ jobs:
             git tag "$tag"
             git push origin "refs/tags/$tag"
           fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          commit="$(git rev-parse "$tag^{commit}")"
+
+          prev_json="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=20" \
+            --jq "[.[] | select(.draft == false and .tag_name != \"$tag\" and ([.assets[].name] | index(\"mygo-music-windows-amd64-cuda.zip\") != null) and any(.assets[].name; startswith(\"mygo-music-setup-\") and endswith(\"-amd64.exe\")))][0]")"
+          if [ -z "$prev_json" ] || [ "$prev_json" = "null" ]; then
+            echo "::error::Could not find a previous published release containing the Windows installer and CUDA runtime ZIP."
+            exit 1
+          fi
+
+          prev_tag="$(printf '%s' "$prev_json" | jq -r '.tag_name')"
+          prev_setup="$(printf '%s' "$prev_json" | jq -r '[.assets[] | select(.name | startswith("mygo-music-setup-") and endswith("-amd64.exe"))][0].name')"
+          prev_setup_sha="$(printf '%s' "$prev_json" | jq -r '[.assets[] | select(.name | startswith("mygo-music-setup-") and endswith("-amd64.exe"))][0].digest // "" | sub("^sha256:"; "")')"
+          prev_cuda_sha="$(printf '%s' "$prev_json" | jq -r '[.assets[] | select(.name == "mygo-music-windows-amd64-cuda.zip")][0].digest // "" | sub("^sha256:"; "")')"
+
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "commit=$commit"
+            echo "prev_tag=$prev_tag"
+            echo "prev_setup=$prev_setup"
+            echo "prev_setup_sha=$prev_setup_sha"
+            echo "prev_cuda_sha=$prev_cuda_sha"
+          } >> "$GITHUB_OUTPUT"
       - name: Create the draft release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.tag.outputs.tag }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
         run: |
+          set -euo pipefail
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            # The notes are the version's section of CHANGELOG.md, or
-            # GitHub's own when it has none.
-            awk -v v="${TAG#v}" '
+            awk -v v="$VERSION" '
               /^## / { if (found) exit; found = index($0, "[" v "]") > 0; next }
               found
             ' CHANGELOG.md > notes.md
             if [ -s notes.md ]; then
+              printf '\n### Windows x64\n\nThis release provides a Windows x64 installer (`mygo-music-setup-%s-amd64.exe`) and the optional CUDA runtime ZIP (`mygo-music-windows-amd64-cuda.zip`).\n' "$VERSION" >> notes.md
               notes=(--notes-file notes.md)
             else
               notes=(--generate-notes)
@@ -62,99 +90,127 @@ jobs:
               --draft --verify-tag --title "$TAG" "${notes[@]}"
           fi
 
-  build:
+  windows:
     needs: draft-release
-    name: ${{ matrix.name }}
+    name: Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 30
     defaults:
       run:
-        shell: bash
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { name: macOS, os: macos-latest, platform: "darwin/arm64,darwin/amd64" }
-          - { name: Windows, os: windows-latest, platform: "windows/amd64,windows/arm64" }
-          - { name: Linux, os: ubuntu-latest, platform: "linux/amd64,linux/arm64" }
+        shell: pwsh
+    env:
+      GH_TOKEN: ${{ github.token }}
+      MYGO_MUSIC_RELEASE_REPOSITORY: ${{ github.repository }}
+      CGO_ENABLED: "0"
+      TAG: ${{ needs.draft-release.outputs.tag }}
+      VERSION: ${{ needs.draft-release.outputs.version }}
+      EXPECTED_COMMIT: ${{ needs.draft-release.outputs.commit }}
+      PREV_TAG: ${{ needs.draft-release.outputs.prev_tag }}
+      PREV_SETUP: ${{ needs.draft-release.outputs.prev_setup }}
+      PREV_SETUP_SHA: ${{ needs.draft-release.outputs.prev_setup_sha }}
     steps:
       - uses: actions/checkout@v7
         with:
           ref: refs/tags/${{ needs.draft-release.outputs.tag }}
-      # mygo build evaluates mygo.config.ts with Bun.
       - uses: oven-sh/setup-bun@v2
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: false
-      # setup-go's own cache is keyed on the runner and go.sum alone, so the
-      # Windows and Linux jobs, both on Ubuntu, race for one key and only
-      # one of them keeps its build cache, and any change to go.sum, like
-      # bumping mygo, starts every job cold. This one is per job, and falls
-      # back to the job's last cache when go.mod or go.sum changes.
       - name: Find Go's caches
         id: go-env
         run: |
-          echo "build=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
-          echo "mod=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
+          echo "build=$(go env GOCACHE)" >> $env:GITHUB_OUTPUT
+          echo "mod=$(go env GOMODCACHE)" >> $env:GITHUB_OUTPUT
       - uses: actions/cache@v6
         with:
           path: |
             ${{ steps.go-env.outputs.build }}
             ${{ steps.go-env.outputs.mod }}
-          key: go-${{ matrix.name }}-${{ hashFiles('go.mod', 'go.sum') }}
-          restore-keys: go-${{ matrix.name }}-
-      # On Windows, mygo downloads NSIS when it is not installed.
-      # The certificate signs the app; the notary profile, "notary" in
-      # mygo.config.ts, notarizes its disk image. Both go in a keychain of the
-      # job, made the default one, where codesign and notarytool look.
-      - name: Import the certificate and the notary credentials
-        if: matrix.name == 'macOS'
-        env:
-          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
-          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          key: go-Windows-${{ hashFiles('go.mod', 'go.sum') }}
+          restore-keys: go-Windows-
+      - name: Restore the unchanged Windows native runtimes
         run: |
-          keychain="$RUNNER_TEMP/signing.keychain-db"
-          password="$(openssl rand -base64 24)"
-          security create-keychain -p "$password" "$keychain"
-          security set-keychain-settings -lut 21600 "$keychain"
-          security unlock-keychain -p "$password" "$keychain"
-          echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
-          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" \
-            -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          rm "$RUNNER_TEMP/certificate.p12"
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain"
-          security list-keychains -d user -s "$keychain" login.keychain
-          security default-keychain -d user -s "$keychain"
-          xcrun notarytool store-credentials notary --keychain "$keychain" \
-            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD"
-      - name: Prepare the Windows x64 Demucs resources
-        if: matrix.name == 'Windows'
-        shell: pwsh
-        run: ./scripts/native-demucs/prepare.ps1
-      - name: Build the Windows x64 Rubber Band engine
-        if: matrix.name == 'Windows'
-        shell: pwsh
-        run: ./scripts/rubberband/prepare.ps1
-      - name: Verify AutoMix's Windows audio engine
-        if: matrix.name == 'Windows'
-        env:
-          MYGO_MUSIC_TEST_RUBBERBAND: "1"
-        run: go test ./internal/player -run '^TestAutomixRubberBand'
-      - name: Build and upload
-        env:
-          GH_TOKEN: ${{ github.token }}
-          MYGO_MUSIC_RELEASE_REPOSITORY: ${{ github.repository }}
-          MYGO_UPDATER_PRIVATE_KEY: ${{ secrets.MYGO_UPDATER_PRIVATE_KEY }}
-        run: go tool mygo build -platform "${{ matrix.platform }}" -upload
-      - name: Upload the optional Windows x64 CUDA runtime
-        if: matrix.name == 'Windows'
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.draft-release.outputs.tag }}
+          $ErrorActionPreference = 'Stop'
+          $old = Join-Path $env:RUNNER_TEMP $env:PREV_SETUP
+          $expanded = Join-Path $env:RUNNER_TEMP 'prior-windows-resources'
+          gh release download $env:PREV_TAG -R $env:GITHUB_REPOSITORY --pattern $env:PREV_SETUP --dir $env:RUNNER_TEMP
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($env:PREV_SETUP_SHA) {
+            $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $old).Hash.ToLowerInvariant()
+            if ($actual -ne $env:PREV_SETUP_SHA.ToLowerInvariant()) {
+              throw "Previous release checksum mismatch: got $actual, expected $($env:PREV_SETUP_SHA)"
+            }
+          }
+          & "$env:ProgramFiles/7-Zip/7z.exe" x -y "-o$expanded" $old
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $resources = New-Item -ItemType Directory -Path resources/windows-amd64 -Force
+          $markers = @{ demucs = 'mygo-demucs.exe'; 'native-codecs' = 'mygo-codec.dll'; rubberband = 'mygo-rubberband.dll' }
+          foreach ($resource in $markers.Keys) {
+            $dir = Get-ChildItem -LiteralPath $expanded -Recurse -Directory -Filter $resource |
+              Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName $markers[$resource]) } |
+              Select-Object -First 1
+            if (!$dir) { throw "Missing previous release resources: $resource" }
+            Copy-Item -LiteralPath $dir.FullName -Destination $resources.FullName -Recurse
+          }
+      - name: Build the Windows x64 installer
         run: |
-          $zip = ./scripts/native-demucs/package.ps1 -CudaOnly
-          gh release upload $env:TAG $zip --repo $env:GITHUB_REPOSITORY --clobber
+          $ErrorActionPreference = 'Stop'
+          go tool mygo build -platform windows/amd64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $app = Get-Item -LiteralPath 'build/windows-amd64/MyGo Music.exe'
+          if ($app.VersionInfo.ProductVersion -ne $env:VERSION) {
+            throw "Unexpected application version: $($app.VersionInfo.ProductVersion)"
+          }
+          $meta = (go version -m $app.FullName) -join [Environment]::NewLine
+          if (!$meta.Contains("vcs.revision=$($env:EXPECTED_COMMIT)") -or !$meta.Contains('vcs.modified=false')) {
+            throw "Package commit mismatch"
+          }
+          $installer = "build/windows-amd64/mygo-music-setup-$($env:VERSION)-amd64.exe"
+          Get-FileHash -Algorithm SHA256 -LiteralPath $installer
+      - name: Upload the verified installer
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $name = "mygo-music-setup-$($env:VERSION)-amd64.exe"
+          $candidate = Join-Path $env:RUNNER_TEMP $name
+          Copy-Item -LiteralPath "build/windows-amd64/$name" -Destination $candidate -Force
+          gh release upload $env:TAG $candidate -R $env:GITHUB_REPOSITORY --clobber
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  cuda:
+    needs: draft-release
+    name: Windows x64 CUDA runtime
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.draft-release.outputs.tag }}
+      PREV_TAG: ${{ needs.draft-release.outputs.prev_tag }}
+      PREV_CUDA_SHA: ${{ needs.draft-release.outputs.prev_cuda_sha }}
+    steps:
+      - name: Transfer and verify the Windows x64 CUDA ZIP on GitHub CI
+        run: |
+          set -euo pipefail
+          asset=mygo-music-windows-amd64-cuda.zip
+          gh release download "$PREV_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$asset"
+          if [ -n "$PREV_CUDA_SHA" ]; then
+            printf '%s  %s\n' "$PREV_CUDA_SHA" "$asset" | sha256sum --check
+          fi
+          gh release upload "$TAG" "$asset" --repo "$GITHUB_REPOSITORY" --clobber
+
+  publish:
+    needs: [draft-release, windows, cuda]
+    name: Publish release
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.draft-release.outputs.tag }}
+      VERSION: ${{ needs.draft-release.outputs.version }}
+    steps:
+      - name: Verify release assets and publish
+        run: |
+          set -euo pipefail
+          assets="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '[.assets[].name]')"
+          printf '%s\n' "$assets" | jq -e --arg setup "mygo-music-setup-${VERSION}-amd64.exe" \
+            'index($setup) != null and index("mygo-music-windows-amd64-cuda.zip") != null' > /dev/null
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
